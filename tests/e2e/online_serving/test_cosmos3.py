@@ -26,7 +26,7 @@ from tests.helpers.runtime import (
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-MODEL = "nvidia/Cosmos3-Nano"
+MODEL = os.environ.get("VLLM_TEST_COSMOS3_MODEL", "nvidia/Cosmos3-Nano")
 PROMPT = "A small warehouse robot moves a blue box across a clean floor."
 EDIT_PROMPT = "Move the blue box to the left side of the table."
 NEGATIVE_PROMPT = "blurry, distorted, low quality"

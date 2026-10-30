@@ -186,6 +186,16 @@ steps:
             '
         mirror_hardwares: h100_1
 
+      - label: "Diffusion · Cosmos3 Test"
+        source_file_dependencies: diffusion_cosmos3_function
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_cosmos3.py tests/e2e/offline_inference/test_cosmos3.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            "
+        mirror_hardwares: h100_1
+
       - label: "Diffusion · Wan22 Test"
         source_file_dependencies: diffusion_wan22_function
         commands:
