@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
+
+from typing import Any
+
+from PIL import Image
 
 COSMOS3_EXTRA_BODY_PARAMS = frozenset(
     {
@@ -50,3 +54,26 @@ COSMOS3_EXTRA_OUTPUT_PARAMS = frozenset(
         "action_mode",
     }
 )
+
+
+def build_image_to_image_prompt(
+    prompt: str,
+    negative_prompt: str | None,
+    input_image: Image.Image | list[Image.Image],
+    height: int | None = None,
+    width: int | None = None,
+) -> dict[str, Any]:
+    """Build a Cosmos3 edit request carrying an image modality."""
+    del height, width
+    if isinstance(input_image, list):
+        if len(input_image) != 1:
+            raise ValueError("Cosmos3 image edit supports a single reference image.")
+        input_image = input_image[0]
+    result: dict[str, Any] = {
+        "prompt": prompt,
+        "modalities": ["image"],
+        "multi_modal_data": {"image": input_image},
+    }
+    if negative_prompt is not None:
+        result["negative_prompt"] = negative_prompt
+    return result

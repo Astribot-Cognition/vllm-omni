@@ -557,6 +557,10 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
             return request
         multi_modal_data = prompt.get("multi_modal_data", {}) or {}
         raw_image = multi_modal_data.get("image")
+        if isinstance(raw_image, (list, tuple)):
+            if len(raw_image) != 1:
+                raise ValueError("Cosmos3 image edit supports a single reference image.")
+            raw_image = raw_image[0]
         raw_video = multi_modal_data.get("video")
         if raw_image is None and raw_video is None:
             return request
@@ -1407,6 +1411,7 @@ class Cosmos3OmniDiffusersPipeline(
             "sound_latents",
             "control_latents",
             "noisy_frame_mask",
+            "und_vision_tokens",
             "action_noisy_mask",
         ):
             if key in kwargs and kwargs[key] is not None:
@@ -1921,6 +1926,44 @@ class Cosmos3OmniDiffusersPipeline(
         if any(x not in accepted_modalities for x in modalities):
             raise ValueError(f"Incorrect modality value in {modalities}, expected one of {accepted_modalities}.")
         return "image" in modalities
+
+    @staticmethod
+    def _is_edit_request(req: DiffusionRequestBatch, image_tensor: torch.Tensor | None) -> bool:
+        """Return whether the request is an image-to-image edit.
+
+        ``modalities=["image"]`` plus a reference image selects edit; without
+        an image the same modality stays T2I.
+        """
+        if image_tensor is None or not req.prompts:
+            return False
+        first_prompt = req.prompts[0]
+        if not isinstance(first_prompt, dict):
+            return False
+        modalities = first_prompt.get("modalities", [])
+        if isinstance(modalities, str):
+            modalities = [modalities]
+        return "image" in (modalities or [])
+
+    @staticmethod
+    def _apply_edit_target_latents(
+        latents: torch.Tensor,
+        target_latents: torch.Tensor | None,
+    ) -> None:
+        """Replace the noisy target slice of an edit latent with caller latents."""
+        if target_latents is None:
+            return
+        if not isinstance(target_latents, torch.Tensor):
+            raise TypeError("Cosmos3 edit latents must be a torch.Tensor.")
+        target_latents = target_latents.to(device=latents.device, dtype=latents.dtype)
+        if target_latents.ndim == 4:
+            target_latents = target_latents.unsqueeze(2)
+        target_slice = latents[:, :, 1:]
+        if target_latents.shape != target_slice.shape:
+            raise ValueError(
+                "Cosmos3 edit latents must match the target latent slice "
+                f"{tuple(target_slice.shape)}, got {tuple(target_latents.shape)}."
+            )
+        latents[:, :, 1:] = target_latents
 
     def _set_timesteps(self, num_inference_steps: int, device: str | torch.device, shift: float) -> None:
         if self.is_distilled_model:
@@ -3832,13 +3875,25 @@ class Cosmos3OmniDiffusersPipeline(
             transfer_video_tensor = additional_info.get("preprocessed_transfer_video")
             transfer_input_fps = positive_float(additional_info.get("transfer_input_fps"))
 
-        is_t2i = self._is_t2i_request(req)
+        is_edit = self._is_edit_request(req, image_tensor)
+        is_t2i = self._is_t2i_request(req) and not is_edit
         sound_enabled = self._is_sound_request(prompt_data, sp)
         action_mode = self._get_action_mode(prompt_data, sp)
         action_enabled = action_mode is not None
         transfer_config = resolve_transfer_config(sp, prompt_data)
         action_video_tensor = video_tensor if action_enabled else None
         is_v2v = video_tensor is not None and not is_t2i and not action_enabled
+        if is_edit:
+            if video_tensor is not None or transfer_config is not None:
+                raise ValueError("Cosmos3 edit accepts a single reference image, not video or transfer inputs.")
+            if action_enabled:
+                raise ValueError("Cosmos3 edit cannot be combined with action generation.")
+            if sound_enabled:
+                raise ValueError("Cosmos3 edit cannot be combined with sound generation.")
+            if self.is_distilled_model:
+                raise ValueError("Cosmos3 edit is not supported for distilled checkpoints.")
+            if self.is_edge_model:
+                raise ValueError("Cosmos3 edit is not supported for Edge checkpoints.")
         self._validate_distilled_generation_mode(
             is_t2i=is_t2i,
             image_tensor=image_tensor,
@@ -3906,7 +3961,18 @@ class Cosmos3OmniDiffusersPipeline(
         #   T2V: 189 frames and 35 steps; regular guidance=6, shift=10;
         #        Edge guidance=5, shift=3;
         #        no guidance interval
-        if is_t2i:
+        if is_edit:
+            height = sp.height or 384
+            width = sp.width or 640
+            if (height, width) != (384, 640):
+                raise ValueError(f"Cosmos3 edit uses the native 640x384 (width x height) canvas; got {width}x{height}.")
+            num_frames = 5
+            num_inference_steps = sp.num_inference_steps or 35
+            guidance_scale = self._resolve_guidance_scale(sp, 2.5)
+            default_flow_shift = 5.0
+            default_guidance_interval = None
+            batch_size = 1
+        elif is_t2i:
             height = sp.height or (
                 COSMOS3_EDGE_T2I_DEFAULT_HEIGHT if self.is_edge_model else COSMOS3_T2I_DEFAULT_HEIGHT
             )
@@ -3986,7 +4052,7 @@ class Cosmos3OmniDiffusersPipeline(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", is_v2v))
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", is_v2v or is_edit))
 
         if action_enabled and action_video_tensor is None:
             extra_action_video = self._get_sp_param(sp, "action_video", None)
@@ -4028,9 +4094,9 @@ class Cosmos3OmniDiffusersPipeline(
             max_sequence_length,
             sp,
             use_system_prompt,
-            is_t2i=is_t2i,
+            is_t2i=is_t2i or is_edit,
+            use_resolution_template=True if is_edit else None,
         )
-
         # --- Prepare latents (T2I, T2V, or I2V) ---
         # T2I shares _prepare_latents with T2V; the math collapses cleanly
         # at num_frames=1 ((1-1)//4 + 1 = 1 latent frame).  For T2I with
@@ -4125,6 +4191,11 @@ class Cosmos3OmniDiffusersPipeline(
             image_latent = None
             condition_latents = None
 
+        if is_edit:
+            self._apply_edit_target_latents(latents, sp.latents)
+        elif sp.latents is not None:
+            raise ValueError("Cosmos3 latents are supported only for image-edit requests.")
+
         T_latent = latents.shape[2]
         H_latent = latents.shape[3]
         W_latent = latents.shape[4]
@@ -4145,6 +4216,10 @@ class Cosmos3OmniDiffusersPipeline(
         shared_kwargs = dict(video_shape=video_shape, fps=frame_rate)
         if velocity_mask is not None:
             shared_kwargs["noisy_frame_mask"] = velocity_mask
+        if is_edit:
+            if image_latent is None:
+                raise ValueError("Cosmos3 edit requires a reference image latent.")
+            shared_kwargs["und_vision_tokens"] = image_latent
         if action_enabled:
             shared_kwargs.update(
                 action_domain_ids=torch.tensor([domain_id], dtype=torch.long, device=self.device),
@@ -4211,6 +4286,12 @@ class Cosmos3OmniDiffusersPipeline(
         if _is_rank_zero():
             logger.info("Decoding video...")
         decode_start = time.time()
+        if is_edit:
+            # Decode only the target latent frame. The Wan VAE temporal
+            # decoder mixes neighboring latent frames, so decoding the clean
+            # source frame together with the target makes frame 1 look like a
+            # blend of the source and the result.
+            latents = latents[:, :, 1:2]
         video = self._decode_latents(latents)
         if _is_rank_zero():
             logger.info("Video decoded in %.2fs", time.time() - decode_start)
@@ -4254,7 +4335,7 @@ class Cosmos3OmniDiffusersPipeline(
             )
 
         return _cosmos3_media_output(
-            output={"image": video} if is_t2i else {"video": video},
+            output={"image": video} if is_t2i or is_edit else {"video": video},
             od_config=self.od_config,
             sampling_params=sp,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,

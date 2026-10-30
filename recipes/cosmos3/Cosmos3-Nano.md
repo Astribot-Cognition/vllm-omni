@@ -6,7 +6,7 @@
 
 - Vendor: NVIDIA
 - Model: `nvidia/Cosmos3-Nano`
-- Task: Text-to-image (T2I), text-to-video (T2V), image-to-video (I2V), and video-to-video (V2V) generation, with optional transfer controls, synchronized audio (video + sound), action policy
+- Task: Text-to-image (T2I), image edit (image-to-image), text-to-video (T2V), image-to-video (I2V), and video-to-video (V2V) generation, with optional transfer controls, synchronized audio (video + sound), action policy
 - Mode: Online serving with the OpenAI-compatible image/video APIs, plus offline generation via the `Omni` API
 - Maintainer: Community
 
@@ -17,6 +17,11 @@ A single pipeline class (`Cosmos3OmniDiffusersPipeline`) serves these modes; the
 mode is selected per request:
 
 - **T2I** — `POST /v1/images/generations` (or a prompt carrying `modalities=["image"]`).
+- **Image edit** — `POST /v1/images/edits` with one reference image, or the
+  shared offline `image_edit.py`. Edit is selected by `modalities=["image"]`
+  plus a reference image, uses the native 640x384 (W x H) canvas, and cannot be
+  combined with video, transfer, sound, or action. Distilled and Edge
+  checkpoints are not supported.
 - **T2V** — `POST /v1/videos/sync` with `num_frames > 1` and no reference image/video.
 - **I2V** — `POST /v1/videos/sync` with a reference image (`input_reference` file
   upload, or `image_reference` JSON).
@@ -193,6 +198,17 @@ curl -sS -X POST http://localhost:8000/v1/images/generations \
     "size": "1024x1024", "n": 1, "response_format": "b64_json",
     "num_inference_steps": 50, "guidance_scale": 7.0, "seed": 42
   }' | python -c "import sys,json,base64; open('cosmos3_t2i.png','wb').write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))"
+
+# Image edit -> /v1/images/edits  (single reference image; native 640x384)
+curl -sS -X POST http://localhost:8000/v1/images/edits \
+  -F "model=nvidia/Cosmos3-Nano" \
+  -F "prompt=Move the yellow box to the left side of the table." \
+  -F "image=@reference.png" \
+  -F "size=640x384" \
+  -F "num_inference_steps=35" -F "guidance_scale=2.5" \
+  -F "seed=42" \
+  -o cosmos3_edit.json
+python -c "import base64,json; p=json.load(open('cosmos3_edit.json')); open('cosmos3_edit.png','wb').write(base64.b64decode(p['data'][0]['b64_json']))"
 
 # Text-to-video -> /v1/videos/sync  (720p, 189 frames @ 24fps; official params)
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
@@ -515,6 +531,17 @@ python examples/offline_inference/text_to_video/text_to_video.py \
                  "use_resolution_template": false, "use_duration_template": false}' \
   --output cosmos3_t2v.mp4
 
+# Image edit -> examples/offline_inference/image_to_image
+python examples/offline_inference/image_to_image/image_edit.py \
+  --model nvidia/Cosmos3-Nano \
+  --deploy-config vllm_omni/deploy/cosmos3_omni.yaml \
+  --image reference.png \
+  --prompt "Move the yellow box to the left side of the table." \
+  --height 384 --width 640 \
+  --num-inference-steps 35 --guidance-scale 2.5 \
+  --extra-args '{"flow_shift": 5.0, "use_system_prompt": true, "use_resolution_template": true}' \
+  --output cosmos3_edit.png
+
 # Image-to-video -> examples/offline_inference/image_to_video
 # (Cosmos3 bundles example frames under assets/; any RGB image works too.)
 python examples/offline_inference/image_to_video/image_to_video.py \
@@ -536,6 +563,11 @@ ffprobe -v error -show_entries stream=codec_type,nb_frames,width,height cosmos3_
 
 #### Notes
 
+- Image edit reuses the I2V latent layout (clean source frame + noisy target) but
+  also puts the clean source into the UND reasoner prefix; only the target latent
+  is decoded. The native canvas is 640x384 (W x H); pad or crop a 640x360 input
+  before sending it. Offline callers can pass `latents` in
+  `OmniDiffusionSamplingParams` to reproduce a target-noise slice.
 - A single `Cosmos3OmniDiffusersPipeline` serves every mode; the standard examples
   select it automatically from `model_index.json`. T2I is chosen by the
   `text_to_image` prompt builder (which marks `modalities=["image"]`); `text_to_video`

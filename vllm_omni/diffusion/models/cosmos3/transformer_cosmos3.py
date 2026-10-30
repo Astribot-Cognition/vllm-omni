@@ -1154,12 +1154,18 @@ class Cosmos3LanguageModel(nn.Module):
         K/V via ``max_real_len`` before the GEN cross-attention sees them.
         """
         hidden = self.embed_tokens(text_ids)
+        return self.forward_embeds(hidden, freqs)
 
+    def forward_embeds(
+        self,
+        hidden: torch.Tensor,
+        freqs: tuple[torch.Tensor, torch.Tensor],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Run the reasoner over precomputed embeddings (UND vision + text)."""
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer in self.layers:
             hidden, k, v = layer(hidden, freqs)
             cached_kv.append((k, v))
-
         return cached_kv
 
 
@@ -1681,8 +1687,9 @@ class Cosmos3VFMTransformer(nn.Module):
         t_sound: int | None = None,
         num_vision_items: int = 1,
         share_vision_temporal_positions: bool = False,
+        und_vision_grid: tuple[int, int, int] | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
-        """Compute mRoPE cos/sin for UND text and GEN media pathways."""
+        """Compute mRoPE cos/sin for UND text (and optional source vision) and GEN media."""
         if num_vision_items <= 0:
             raise ValueError(f"Cosmos3 num_vision_items must be positive, got {num_vision_items}.")
         B = text_mask.shape[0]
@@ -1696,8 +1703,28 @@ class Cosmos3VFMTransformer(nn.Module):
         gen_pos_list = []
         for b in range(B):
             real_len = int(text_lengths[b].item())
-            t_pos, t_offset = compute_mrope_position_ids_text(real_len, temporal_offset=0)
-            media_temporal_offset = t_offset + self.temporal_modality_margin
+            und_pos_ids = None
+            if und_vision_grid is not None:
+                # Edit mode prepends clean source vision tokens to the UND
+                # sequence; text starts after them and GEN media starts after
+                # the text.
+                und_t, und_h, und_w = und_vision_grid
+                und_v_pos, text_start_offset = compute_mrope_position_ids_vision(
+                    und_t,
+                    und_h,
+                    und_w,
+                    temporal_offset=0,
+                    fps=None,
+                    base_fps=self.base_fps,
+                    temporal_compression_factor=self.temporal_compression_factor,
+                    enable_fps_modulation=self.enable_fps_modulation,
+                )
+                t_pos, _ = compute_mrope_position_ids_text(real_len, temporal_offset=text_start_offset)
+                und_pos_ids = torch.cat([und_v_pos, t_pos], dim=1)
+                media_temporal_offset = text_start_offset + real_len + self.temporal_modality_margin
+            else:
+                t_pos, text_end_offset = compute_mrope_position_ids_text(real_len, temporal_offset=0)
+                media_temporal_offset = text_end_offset + self.temporal_modality_margin
             gen_positions = []
             if num_vision_items == 1 or share_vision_temporal_positions:
                 v_pos, _ = compute_mrope_position_ids_vision(
@@ -1750,15 +1777,18 @@ class Cosmos3VFMTransformer(nn.Module):
             for pos in gen_positions[1:]:
                 pos_dtype = torch.promote_types(pos_dtype, pos.dtype)
             v_pos = torch.cat([pos.to(pos_dtype) for pos in gen_positions], dim=1)
-            if real_len < S_text:
-                t_pos = torch.cat(
-                    [t_pos, torch.zeros(3, S_text - real_len, dtype=t_pos.dtype)],
-                    dim=1,
-                )
-            text_pos_list.append(t_pos)
+            if und_pos_ids is not None:
+                text_pos_list.append(und_pos_ids)
+            else:
+                if real_len < S_text:
+                    t_pos = torch.cat(
+                        [t_pos, torch.zeros(3, S_text - real_len, dtype=t_pos.dtype)],
+                        dim=1,
+                    )
+                text_pos_list.append(t_pos)
             gen_pos_list.append(v_pos)
 
-        text_pos_ids = torch.stack(text_pos_list, dim=1).to(device)  # [3, B, S_text]
+        text_pos_ids = torch.stack(text_pos_list, dim=1).to(device)  # [3, B, S_und]
         gen_pos_ids = torch.stack(gen_pos_list, dim=1).to(device)  # [3, B, S_gen]
 
         rotary_emb = self.language_model.rotary_emb
@@ -1880,6 +1910,7 @@ class Cosmos3VFMTransformer(nn.Module):
         action_fps: float | None = None,
         sound_latents: torch.Tensor | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
+        und_vision_tokens: torch.Tensor | None = None,
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
         control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         transfer_share_vision_temporal_positions: bool = True,
@@ -1902,6 +1933,7 @@ class Cosmos3VFMTransformer(nn.Module):
             action_fps=action_fps,
             sound_latents=sound_latents,
             noisy_frame_mask=noisy_frame_mask,
+            und_vision_tokens=und_vision_tokens,
             control_latents=control_latents,
             control_weights=control_weights,
             transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
@@ -1944,6 +1976,7 @@ class Cosmos3VFMTransformer(nn.Module):
         action_fps: float | None = None,
         sound_latents: torch.Tensor | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
+        und_vision_tokens: torch.Tensor | None = None,
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
         control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         transfer_share_vision_temporal_positions: bool = True,
@@ -2072,10 +2105,31 @@ class Cosmos3VFMTransformer(nn.Module):
             sound_tokens = self.pack_sound(sound_latents)
             s_sound = sound_tokens.shape[1]
 
+        # Edit mode: project the clean source image into the UND pathway so the
+        # reasoner sees [source vision | text], matching the training pack.
+        und_vision_grid = None
+        und_vision_hidden = None
+        need_kv = self.cached_kv is None
+        if und_vision_tokens is not None:
+            if und_vision_tokens.ndim == 4:
+                und_vision_tokens = und_vision_tokens.unsqueeze(0)
+            if und_vision_tokens.ndim != 5 or und_vision_tokens.shape[2] != 1:
+                raise ValueError(
+                    f"Cosmos3 und_vision_tokens must have shape [B, C, 1, H, W], got {tuple(und_vision_tokens.shape)}."
+                )
+            if und_vision_tokens.shape[0] != hidden_states.shape[0]:
+                raise ValueError(
+                    "Cosmos3 und_vision_tokens batch must match hidden_states: "
+                    f"{und_vision_tokens.shape[0]} vs {hidden_states.shape[0]}."
+                )
+            und_vision_grid = (1, hp, wp)
+            if need_kv:
+                with self._offload_context("generator"):
+                    und_vision_hidden = self.proj_in(self.patchify(und_vision_tokens, 1, h, w))
+
         # Run UND pathway once and cache K/V (replicated across all ranks).
         # freqs_gen (M-RoPE cos/sin) is derived purely from shape/fps and is
         # cached alongside UND K/V by both the bespoke and session-state paths.
-        need_kv = self.cached_kv is None
         if need_kv or self.cached_freqs_gen is None:
             freqs_und, freqs_gen = self._compute_rope_freqs(
                 text_mask,
@@ -2091,15 +2145,21 @@ class Cosmos3VFMTransformer(nn.Module):
                 t_sound=s_sound,
                 num_vision_items=len(control_latent_list) + 1,
                 share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+                und_vision_grid=und_vision_grid,
             )
             self.cached_freqs_gen = freqs_gen
 
             if need_kv:
                 with self._offload_context("reasoner"):
-                    cached_kv_full = self.language_model(text_ids, freqs_und)
-                # Trim to real text length (remove padding).  K/V stay replicated;
-                # the framework Attention layer head-slices them via joint_key/value.
-                self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+                    if und_vision_hidden is not None:
+                        text_hidden = self.language_model.embed_tokens(text_ids[:, :max_real_len])
+                        hidden_und = torch.cat([und_vision_hidden, text_hidden], dim=1)
+                        self.cached_kv = self.language_model.forward_embeds(hidden_und, freqs_und)
+                    else:
+                        cached_kv_full = self.language_model(text_ids, freqs_und)
+                        # Trim to real text length (remove padding).  K/V stay replicated;
+                        # the framework Attention layer head-slices them via joint_key/value.
+                        self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
 
         with self._offload_context("generator"):
             # Patchify latents and project to hidden space after UND cache

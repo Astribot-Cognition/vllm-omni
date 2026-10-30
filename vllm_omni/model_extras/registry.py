@@ -24,6 +24,9 @@ from vllm_omni.model_extras.cosmos3 import (
     COSMOS3_EXTRA_BODY_PARAMS,
     COSMOS3_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.cosmos3 import (
+    build_image_to_image_prompt as build_cosmos3_image_to_image_prompt,
+)
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -237,6 +240,7 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "Cosmos3OmniDiffusersPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
+        "image_to_image_prompt_builder": build_cosmos3_image_to_image_prompt,
         # The shared T2I example already supplies modalities=["image"].
     },
     "Cosmos3OmniPipeline": {
