@@ -506,6 +506,34 @@ def test_bagel_image_to_image_prompt_builder() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_cosmos3_image_to_image_prompt_builder() -> None:
+    dummy_image = Image.new("RGB", (64, 64))
+    result = build_image_to_image_prompt(
+        "Cosmos3OmniDiffusersPipeline",
+        prompt="move the box",
+        negative_prompt="blurry",
+        input_image=dummy_image,
+        height=384,
+        width=640,
+    )
+    assert result == {
+        "prompt": "move the box",
+        "modalities": ["image"],
+        "multi_modal_data": {"image": dummy_image},
+        "negative_prompt": "blurry",
+    }
+
+    with pytest.raises(ValueError, match="single reference image"):
+        build_image_to_image_prompt(
+            "Cosmos3OmniDiffusersPipeline",
+            prompt="move the box",
+            negative_prompt=None,
+            input_image=[dummy_image, dummy_image],
+        )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_qwen_image_21_extra_registry_declares_sigmas() -> None:
     assert get_extra_body_params("QwenImage21Pipeline") == frozenset({"sigmas"})
     assert get_extra_output_params("QwenImage21Pipeline") == frozenset()

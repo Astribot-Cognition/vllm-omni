@@ -367,6 +367,7 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
         "resolved_frame_rate": None,
         "max_sequence_length": None,
         "output_type": None,
+        "latents": None,
         "extra_args": {},
     }
     values.update(overrides)
@@ -1202,6 +1203,35 @@ def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     additional = preprocess(v2v).prompt["additional_information"]
     assert tuple(additional["preprocessed_video"].shape) == (1, 3, 5, 16, 32)
     assert additional["condition_frame_indexes_vision"] == [0, 1]
+
+
+def test_preprocess_accepts_single_image_list() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    image = Image.new("RGB", (320, 160))
+    request = SimpleNamespace(
+        prompt={
+            "prompt": "Move the box.",
+            "modalities": ["image"],
+            "multi_modal_data": {"image": [image]},
+        },
+        sampling_params=make_sampling_params(height=384, width=640, extra_args={}),
+    )
+    additional = preprocess(request).prompt["additional_information"]
+    assert tuple(additional["preprocessed_image"].shape[-2:]) == (384, 640)
+
+    with pytest.raises(ValueError, match="single reference image"):
+        preprocess(
+            SimpleNamespace(
+                prompt={
+                    "prompt": "Move the box.",
+                    "modalities": ["image"],
+                    "multi_modal_data": {"image": [image, image]},
+                },
+                sampling_params=make_sampling_params(height=384, width=640, extra_args={}),
+            )
+        )
 
 
 def test_preprocess_v2v_decodes_uploaded_video_path(tmp_path) -> None:
@@ -2953,6 +2983,7 @@ class TestForwardRouting:
             sp,
             use_system_prompt=False,
             is_t2i=False,
+            use_resolution_template=None,
         ):
             captured["format"] = {
                 "prompt": prompt,
@@ -2963,6 +2994,7 @@ class TestForwardRouting:
                 "width": width,
                 "use_system_prompt": use_system_prompt,
                 "is_t2i": is_t2i,
+                "use_resolution_template": use_resolution_template,
             }
             return _ids(2), _mask(), _ids(1), _mask()
 
@@ -3040,6 +3072,175 @@ class TestForwardRouting:
         assert captured["flow_shifts"] == expected["flow"]
         assert [call["num_inference_steps"] for call in pipeline.scheduler.set_timesteps_calls] == expected["steps"]
         assert all(call["shift"] == expected["flow"][0] for call in pipeline.scheduler.set_timesteps_calls)
+
+    @pytest.mark.parametrize(
+        ("prompt", "has_image", "expected"),
+        [
+            ({"prompt": "edit", "modalities": ["image"]}, True, True),
+            ({"prompt": "edit", "modalities": "image"}, True, True),
+            ({"prompt": "edit", "modalities": ["video"]}, True, False),
+            ({"prompt": "edit", "modalities": ["image"]}, False, False),
+            ("plain prompt", True, False),
+        ],
+    )
+    def test_is_edit_request(self, prompt, has_image, expected) -> None:
+        from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+        request = make_request_batch(prompt, make_sampling_params())
+        image = torch.zeros(1, 3, 16, 16) if has_image else None
+        assert Cosmos3OmniDiffusersPipeline._is_edit_request(request, image) is expected
+
+    def test_is_edit_request_requires_prompt(self) -> None:
+        from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+        request = SimpleNamespace(prompts=[])
+        assert Cosmos3OmniDiffusersPipeline._is_edit_request(request, torch.zeros(1, 3, 16, 16)) is False
+
+    def test_apply_edit_target_latents(self) -> None:
+        from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+        latents = torch.zeros(1, 2, 2, 1, 1)
+        target = torch.ones(1, 2, 1, 1, 1)
+        Cosmos3OmniDiffusersPipeline._apply_edit_target_latents(latents, target)
+        assert torch.equal(latents[:, :, 0:1], torch.zeros(1, 2, 1, 1, 1))
+        assert torch.equal(latents[:, :, 1:], target)
+
+        latents = torch.zeros(1, 2, 2, 1, 1)
+        Cosmos3OmniDiffusersPipeline._apply_edit_target_latents(latents, target.squeeze(2))
+        assert torch.equal(latents[:, :, 1:], target)
+
+        with pytest.raises(ValueError, match="target latent slice"):
+            Cosmos3OmniDiffusersPipeline._apply_edit_target_latents(
+                torch.zeros(1, 2, 2, 1, 1),
+                torch.zeros(1, 2, 1, 2, 1),
+            )
+        with pytest.raises(TypeError, match="torch.Tensor"):
+            Cosmos3OmniDiffusersPipeline._apply_edit_target_latents(
+                torch.zeros(1, 2, 2, 1, 1),
+                [[0.0]],
+            )
+
+    def test_forward_edit_uses_und_vision_and_target_only_decode(self, make_cosmos3_pipeline) -> None:
+        pipeline = make_cosmos3_pipeline()
+        captured = self._install_forward_stubs(pipeline)
+        image_tensor = torch.zeros(1, 3, 16, 16)
+        source_latent = torch.full((1, 2, 1, 1, 1), 3.0)
+        target_latent = torch.full((1, 2, 1, 1, 1), 7.0)
+        prepare_calls: list[tuple[int, int, int]] = []
+
+        def fake_prepare_i2v(image, height, width, num_frames, generator):
+            del image, generator
+            prepare_calls.append((height, width, num_frames))
+            return torch.zeros(1, 2, 2, 1, 1), torch.ones(1, 1, 2, 1, 1), source_latent
+
+        pipeline._prepare_latents_i2v = fake_prepare_i2v
+
+        def fake_diffuse(**kwargs):
+            captured["diffuse_calls"].append(kwargs)
+            return kwargs["latents"]
+
+        pipeline.diffuse = fake_diffuse
+        decoded: list[torch.Tensor] = []
+
+        def fake_decode(latents):
+            decoded.append(latents)
+            return latents
+
+        pipeline._decode_latents = fake_decode
+        output = pipeline.forward(
+            make_request_batch(
+                {
+                    "prompt": "move",
+                    "modalities": ["image"],
+                    "additional_information": {"preprocessed_image": image_tensor},
+                },
+                make_sampling_params(height=384, width=640, num_frames=1, latents=target_latent),
+            )
+        )
+
+        assert prepare_calls == [(384, 640, 5)]
+        assert captured["format"]["is_t2i"] is True
+        assert captured["format"]["num_frames"] == 5
+        assert captured["format"]["use_resolution_template"] is True
+        assert captured["flow_shifts"][-1] == 5.0
+        diffuse_kwargs = captured["diffuse_calls"][-1]
+        assert diffuse_kwargs["shared_kwargs"]["und_vision_tokens"] is source_latent
+        assert torch.equal(diffuse_kwargs["latents"][:, :, 0:1], torch.zeros_like(source_latent))
+        assert torch.equal(diffuse_kwargs["latents"][:, :, 1:], target_latent)
+        assert len(decoded) == 1
+        assert decoded[0].shape == target_latent.shape
+        assert torch.equal(decoded[0], target_latent)
+        assert "image" in output.output
+
+    def test_forward_edit_rejects_unsupported_combinations(
+        self, make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as pipeline_module
+
+        pipeline = make_cosmos3_pipeline()
+        self._install_forward_stubs(pipeline)
+        image_tensor = torch.zeros(1, 3, 16, 16)
+
+        def _forward(*, prompt_extra=None, sampling_extra=None):
+            prompt = {
+                "prompt": "move",
+                "modalities": ["image"],
+                "additional_information": {"preprocessed_image": image_tensor},
+            }
+            if prompt_extra:
+                prompt.update(prompt_extra)
+            sampling = make_sampling_params(height=384, width=640)
+            if sampling_extra:
+                for key, value in sampling_extra.items():
+                    setattr(sampling, key, value)
+            return pipeline.forward(make_request_batch(prompt, sampling))
+
+        with pytest.raises(ValueError, match="sound"):
+            _forward(prompt_extra={"generate_sound": True})
+        with pytest.raises(ValueError, match="action"):
+            _forward(
+                sampling_extra={
+                    "extra_args": {
+                        "action_mode": "policy",
+                        "action_chunk_size": 2,
+                        "raw_action_dim": 2,
+                        "domain_name": "bridge_orig_lerobot",
+                    }
+                }
+            )
+        with pytest.raises(ValueError, match="video or transfer"):
+            _forward(
+                prompt_extra={
+                    "additional_information": {
+                        "preprocessed_image": image_tensor,
+                        "preprocessed_video": torch.zeros(1, 3, 5, 16, 16),
+                    }
+                }
+            )
+        monkeypatch.setattr(pipeline_module, "resolve_transfer_config", lambda *args, **kwargs: object())
+        with pytest.raises(ValueError, match="video or transfer"):
+            _forward()
+        monkeypatch.undo()
+        with pytest.raises(ValueError, match="native"):
+            _forward(sampling_extra={"height": 16, "width": 16})
+
+        pipeline.is_distilled_model = True
+        with pytest.raises(ValueError, match="distilled"):
+            _forward()
+        pipeline.is_distilled_model = False
+        pipeline.is_edge_model = True
+        with pytest.raises(ValueError, match="Edge"):
+            _forward()
+
+    def test_forward_rejects_latents_outside_edit(self, make_cosmos3_pipeline) -> None:
+        pipeline = make_cosmos3_pipeline()
+        self._install_forward_stubs(pipeline)
+        request = make_request_batch(
+            {"prompt": "paint", "modalities": ["image"]},
+            make_sampling_params(latents=torch.zeros(1, 2, 1, 1, 1)),
+        )
+        with pytest.raises(ValueError, match="only for image-edit"):
+            pipeline.forward(request)
 
     def test_forward_i2v_sound_and_action_routes(self, make_cosmos3_pipeline) -> None:
         pipeline = make_cosmos3_pipeline()
@@ -3207,6 +3408,7 @@ class TestForwardRouting:
             "width": 16,
             "use_system_prompt": False,
             "is_t2i": False,
+            "use_resolution_template": None,
         }
         assert "flow_shifts" not in captured
         assert pipeline.scheduler.set_timesteps_calls == []

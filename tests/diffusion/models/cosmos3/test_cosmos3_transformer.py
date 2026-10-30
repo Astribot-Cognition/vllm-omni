@@ -842,8 +842,8 @@ def test_sp_releases_full_gen_embedding_during_stack(
     from vllm_omni.diffusion.hooks import sequence_parallel
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
-    full_refs = []
-    full_pointers = []
+    full_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    full_pointers: list[int] = []
     layer_calls = 0
     total_length = sequence_length * (control_count + 1)
     uses_sp = control_count <= 1
@@ -1522,6 +1522,91 @@ def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> No
     )
     _, offset_gen_pos = rotary.position_ids
     assert offset_gen_pos[0, 0].tolist() == [102, 103, 104, 105, 106, 107]
+
+
+def test_compute_rope_freqs_prepends_edit_source_vision() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    class FakeRotary:
+        def __init__(self) -> None:
+            self.position_ids: list[torch.Tensor] = []
+
+        def __call__(self, x, position_ids):
+            del x
+            self.position_ids.append(position_ids.detach().cpu())
+            batch, seq = position_ids.shape[1], position_ids.shape[2]
+            return torch.zeros(batch, seq, 4), torch.ones(batch, seq, 4)
+
+    rotary = FakeRotary()
+    model = object.__new__(Cosmos3VFMTransformer)
+    nn.Module.__init__(model)
+    model.language_model = SimpleNamespace(rotary_emb=rotary)
+    model.temporal_modality_margin = 100
+    model.base_fps = 24.0
+    model.temporal_compression_factor = 4
+    model.temporal_compression_factor_sound = 1
+    model.sound_latent_fps = 25.0
+    model.enable_fps_modulation = False
+
+    model._compute_rope_freqs(
+        text_mask=torch.tensor([[1, 1]], dtype=torch.long),
+        t=2,
+        hp=1,
+        wp=1,
+        fps=24.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        und_vision_grid=(1, 2, 2),
+    )
+
+    text_pos, gen_pos = rotary.position_ids
+    # Source vision occupies t=0 with a 2x2 spatial grid; text starts after
+    # the largest spatial index (1), and GEN media follows the text.
+    assert text_pos[:, 0, :].tolist() == [
+        [0, 0, 0, 0, 2, 3],
+        [0, 0, 1, 1, 2, 3],
+        [0, 1, 0, 1, 2, 3],
+    ]
+    assert gen_pos[0, 0].tolist() == [104, 105]
+
+
+def test_gen_preprocess_prepends_source_vision_to_und_kv(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    captured: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    original = model.language_model.forward_embeds
+
+    def fake_forward_embeds(hidden, freqs):
+        captured.append((tuple(hidden.shape), tuple(freqs[0].shape)))
+        return original(hidden, freqs)
+
+    model.language_model.forward_embeds = fake_forward_embeds
+    source = torch.zeros(1, 2, 1, 2, 2)
+    prep = model._gen_preprocess(
+        torch.zeros(1, 2, 1, 2, 2),
+        torch.tensor([1.0]),
+        torch.tensor([[1, 2]], dtype=torch.long),
+        torch.ones(1, 2, dtype=torch.long),
+        (1, 2, 2),
+        und_vision_tokens=source,
+    )
+    assert prep is not None
+    assert captured[0][0] == (1, 6, 8)
+    assert captured[0][1] == (1, 6, 1, 4)
+
+    model._gen_preprocess(
+        torch.zeros(1, 2, 1, 2, 2),
+        torch.tensor([1.0]),
+        torch.tensor([[1, 2]], dtype=torch.long),
+        torch.ones(1, 2, dtype=torch.long),
+        (1, 2, 2),
+        und_vision_tokens=source,
+    )
+    assert len(captured) == 1
 
 
 def test_shard_gen_prep_rejects_inputs_already_in_execution_layout(monkeypatch: pytest.MonkeyPatch) -> None:

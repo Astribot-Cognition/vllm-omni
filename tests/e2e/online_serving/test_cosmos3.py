@@ -7,10 +7,13 @@ These keep Cosmos3 in the regular ``core_model`` diffusion lane while the
 broader image/video similarity checks stay in ``tests/e2e/accuracy``.
 """
 
+import base64
+import io
 import os
 from typing import Any
 
 import pytest
+from PIL import Image
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image, generate_synthetic_video
@@ -18,12 +21,14 @@ from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
     OnlineOmniClient,
+    OpenAIClientHandler,
 )
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "nvidia/Cosmos3-Nano"
 PROMPT = "A small warehouse robot moves a blue box across a clean floor."
+EDIT_PROMPT = "Move the blue box to the left side of the table."
 NEGATIVE_PROMPT = "blurry, distorted, low quality"
 VIDEO_SHAPE = {
     "height": 256,
@@ -81,6 +86,38 @@ def test_text_to_image_001(omni_server: OmniServer, online_client: OnlineOmniCli
     assert isinstance(payload, dict)
     assert len(payload["data"]) == 1
     assert payload["data"][0]["b64_json"]
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+@pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
+def test_image_edit_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+    """Default Cosmos3 image-edit smoke through ``/v1/images/edits``."""
+    image_bytes = base64.b64decode(generate_synthetic_image(640, 384)["base64"])
+    responses = openai_client.send_images_edits_http_request(
+        {
+            "data": {
+                "model": omni_server.model,
+                "prompt": EDIT_PROMPT,
+                "num_inference_steps": 2,
+                "guidance_scale": 1.0,
+                "seed": 42,
+            },
+            "files": {"image": ("reference.jpg", image_bytes, "image/jpeg")},
+            "timeout": 300,
+        }
+    )
+
+    response = responses[0]
+    assert response.success, response.error_message
+    payload = response.json_body
+    assert isinstance(payload, dict)
+    assert len(payload["data"]) == 1
+    encoded = payload["data"][0]["b64_json"]
+    assert encoded
+    image = Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+    assert image.size == (640, 384)
 
 
 @pytest.mark.core_model
