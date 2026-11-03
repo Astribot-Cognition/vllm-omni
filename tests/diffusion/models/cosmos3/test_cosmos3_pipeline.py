@@ -3131,6 +3131,48 @@ class TestForwardRouting:
         request = SimpleNamespace(prompts=[])
         assert Cosmos3OmniDiffusersPipeline._is_edit_request(request, torch.zeros(1, 3, 16, 16)) is False
 
+    def test_prepare_latents_edit_draws_target_only_noise(self) -> None:
+        from types import MethodType
+
+        from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+        channels, latent_h, latent_w = 4, 2, 2
+        source = torch.arange(channels * latent_h * latent_w, dtype=torch.float32).reshape(
+            1, channels, 1, latent_h, latent_w
+        )
+        pipeline = SimpleNamespace(
+            transformer=SimpleNamespace(latent_channel_size=channels),
+            vae_scale_factor_temporal=4,
+            vae_scale_factor_spatial=16,
+            device=torch.device("cpu"),
+            sampling_dtype=torch.float32,
+        )
+        pipeline._encode_conditioning_image_latent = lambda image: source
+        pipeline._prepare_latents_edit = MethodType(Cosmos3OmniDiffusersPipeline._prepare_latents_edit, pipeline)
+
+        generator = torch.Generator(device="cpu").manual_seed(11)
+        expected_generator = torch.Generator(device="cpu").manual_seed(11)
+        expected_noise = torch.randn(
+            (1, channels, 1, latent_h, latent_w),
+            generator=expected_generator,
+            dtype=torch.float32,
+        )
+        expected_next = torch.randn(1, generator=expected_generator)
+
+        latents, velocity_mask, image_latent = pipeline._prepare_latents_edit(
+            torch.zeros(1, 3, 32, 32), 32, 32, 5, generator
+        )
+        actual_next = torch.randn(1, generator=generator)
+
+        assert torch.equal(latents[:, :, 0:1], source)
+        assert torch.equal(latents[:, :, 1:], expected_noise)
+        assert torch.equal(image_latent, source)
+        # A two-frame draw would leave the generator at a different offset.
+        assert torch.equal(actual_next, expected_next)
+        assert velocity_mask.shape == (1, 1, 2, 1, 1)
+        assert velocity_mask[0, 0, 0].item() == 0.0
+        assert velocity_mask[0, 0, 1].item() == 1.0
+
     def test_apply_edit_target_latents(self) -> None:
         from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
 
@@ -3163,12 +3205,12 @@ class TestForwardRouting:
         target_latent = torch.full((1, 2, 1, 1, 1), 7.0)
         prepare_calls: list[tuple[int, int, int]] = []
 
-        def fake_prepare_i2v(image, height, width, num_frames, generator):
+        def fake_prepare_edit(image, height, width, num_frames, generator):
             del image, generator
             prepare_calls.append((height, width, num_frames))
             return torch.zeros(1, 2, 2, 1, 1), torch.ones(1, 1, 2, 1, 1), source_latent
 
-        pipeline._prepare_latents_i2v = fake_prepare_i2v
+        pipeline._prepare_latents_edit = fake_prepare_edit
 
         def fake_diffuse(**kwargs):
             captured["diffuse_calls"].append(kwargs)

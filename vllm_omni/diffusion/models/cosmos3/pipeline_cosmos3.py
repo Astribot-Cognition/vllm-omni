@@ -2608,6 +2608,50 @@ class Cosmos3OmniDiffusersPipeline(
         latent = self._crop_latent_to_image_size(latent, image_size)
         return latent.to(self.sampling_dtype)
 
+    def _prepare_latents_edit(
+        self,
+        image_tensor: torch.Tensor,
+        height: int,
+        width: int,
+        num_frames: int,
+        generator: torch.Generator,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare edit latents with diffusers-compatible target-only noise.
+
+        The reference diffusers edit path encodes the source frame first and
+        then draws exactly one target latent frame. Drawing a full
+        ``[1, C, T_lat, H_lat, W_lat]`` tensor here would consume twice the RNG
+        stream and leave the target frame using the second half of that stream.
+        This helper draws only the target frame and assembles the clean source
+        frame in front of it, matching the reference noise exactly.
+
+        Returns:
+            latents: [1, C, 2, H_lat, W_lat] with frame 0 = image, frame 1 = noise
+            velocity_mask: [1, 1, 2, 1, 1] with frame 0 = 0, frame 1 = 1
+            image_latent: [1, C, 1, H_lat, W_lat] clean frame 0 for re-injection
+        """
+        C = self.transformer.latent_channel_size
+        T_lat = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+        if T_lat != 2:
+            raise ValueError(f"Cosmos3 edit expects T_lat=2, got {T_lat}")
+        H_lat = height // self.vae_scale_factor_spatial
+        W_lat = width // self.vae_scale_factor_spatial
+
+        # Match the diffusers order: encode the source latent before drawing
+        # the target noise so the generator state is not advanced differently.
+        image_latent = self._encode_conditioning_image_latent(image_tensor)
+        noise = randn_tensor(
+            (1, C, 1, H_lat, W_lat),
+            generator=generator,
+            device=self.device,
+            dtype=self.sampling_dtype,
+        )
+        latents = torch.cat((image_latent, noise), dim=2)
+
+        velocity_mask = torch.ones(1, 1, T_lat, 1, 1, device=self.device, dtype=self.sampling_dtype)
+        velocity_mask[:, :, 0, :, :] = 0.0
+        return latents, velocity_mask, image_latent
+
     def _prepare_latents_i2v(
         self,
         image_tensor: torch.Tensor,
@@ -4220,6 +4264,15 @@ class Cosmos3OmniDiffusersPipeline(
                 condition_frame_indexes_vision,
             )
             image_latent = None
+        elif is_edit:
+            latents, velocity_mask, image_latent = self._prepare_latents_edit(
+                image_tensor,
+                height,
+                width,
+                num_frames,
+                generator,
+            )
+            condition_latents = None
         elif image_tensor is not None and not is_t2i:
             latents, velocity_mask, image_latent = self._prepare_latents_i2v(
                 image_tensor,
