@@ -125,6 +125,41 @@ def test_sampling_dtype_defaults_to_float32() -> None:
     assert Cosmos3OmniDiffusersPipeline.sampling_dtype == torch.float32
 
 
+@pytest.mark.parametrize(
+    ("model_config", "expected"),
+    [
+        (None, torch.bfloat16),
+        ({}, torch.bfloat16),
+        ({"vae_dtype": "bfloat16"}, torch.bfloat16),
+        ({"vae_dtype": "float16"}, torch.float16),
+        ({"vae_dtype": "float32"}, torch.float32),
+        ({"vae_dtype": torch.float32}, torch.float32),
+    ],
+)
+def test_resolve_vae_dtype(model_config, expected) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _resolve_vae_dtype
+
+    od_config = SimpleNamespace(dtype=torch.bfloat16, model_config=model_config)
+    assert _resolve_vae_dtype(od_config) == expected
+
+
+@pytest.mark.parametrize("value", ["bf16", "fp16", "fp32", "float64"])
+def test_resolve_vae_dtype_rejects_noncanonical_names(value) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _resolve_vae_dtype
+
+    od_config = SimpleNamespace(dtype=torch.bfloat16, model_config={"vae_dtype": value})
+    with pytest.raises(ValueError, match="Unsupported Cosmos3 vae_dtype"):
+        _resolve_vae_dtype(od_config)
+
+
+def test_resolve_vae_dtype_rejects_non_mapping_model_config() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _resolve_vae_dtype
+
+    od_config = SimpleNamespace(dtype=torch.bfloat16, model_config=["not", "a", "mapping"])
+    with pytest.raises(TypeError, match="model_config must be a mapping"):
+        _resolve_vae_dtype(od_config)
+
+
 class StubScheduler:
     def __init__(
         self,

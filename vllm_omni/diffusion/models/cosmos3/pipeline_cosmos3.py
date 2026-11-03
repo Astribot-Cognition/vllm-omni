@@ -212,6 +212,40 @@ COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
 
 
+def _resolve_vae_dtype(od_config: OmniDiffusionConfig) -> torch.dtype:
+    """Resolve the Cosmos3 VAE dtype from ``model_config["vae_dtype"]``.
+
+    The default follows the runtime model dtype (bf16 for the released Cosmos3
+    checkpoints), matching the vLLM-Omni default. The reference diffusers
+    pipeline upcasts the bf16 VAE weights to float32 for compute; set
+    ``model_config["vae_dtype"] = "float32"`` when that numerical parity is
+    required.
+    """
+    model_config = getattr(od_config, "model_config", None)
+    if model_config is None:
+        model_config = {}
+    if not isinstance(model_config, Mapping):
+        raise TypeError(f"Cosmos3 model_config must be a mapping, got {type(model_config).__name__}")
+
+    value = model_config.get("vae_dtype")
+    if value is None:
+        return od_config.dtype or torch.bfloat16
+    if isinstance(value, torch.dtype):
+        return value
+    if not isinstance(value, str):
+        raise TypeError(f"Cosmos3 vae_dtype must be a string or torch.dtype, got {type(value).__name__}")
+
+    dtype_by_name = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    normalized = value.lower()
+    if normalized not in dtype_by_name:
+        raise ValueError(f"Unsupported Cosmos3 vae_dtype: {value!r}; expected one of {sorted(dtype_by_name)}")
+    return dtype_by_name[normalized]
+
+
 def _ceil_video_num_frames(num_frames: int, temporal_compression_factor: int) -> int:
     """Round a video length up to the causal VAE's ``factor * k + 1`` grid."""
     if temporal_compression_factor <= 0:
@@ -1064,12 +1098,22 @@ class Cosmos3OmniDiffusersPipeline(
         )
 
         # --- VAE ---
+        # VAE precision is independent of the transformer dtype: the released
+        # Cosmos3 VAE weights are bf16, while the diffusers reference upcasts
+        # them to fp32 for compute. ``model_config["vae_dtype"]`` selects the
+        # compute dtype without changing the transformer.
+        vae_dtype = _resolve_vae_dtype(od_config)
         self.vae = DistributedAutoencoderKLWan.from_pretrained(
             model_path,
             subfolder="vae",
-            torch_dtype=self.dtype,
+            torch_dtype=vae_dtype,
             local_files_only=local_files_only,
         ).to(self.device)
+        logger.info(
+            "Cosmos3 VAE dtype: %s (transformer dtype: %s)",
+            vae_dtype,
+            self.dtype,
+        )
 
         if not hasattr(self.vae.config, "scale_factor_temporal"):
             raise ValueError(
