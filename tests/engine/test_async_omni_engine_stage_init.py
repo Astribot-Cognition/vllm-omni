@@ -689,13 +689,14 @@ def test_initialize_diffusion_stage_preserves_configured_max_num_seqs(monkeypatc
     captured: dict[str, object] = {}
     monkeypatch.setattr(init_mod, "build_diffusion_config", lambda *args: od_config)
 
-    def _capture_client(model, config, metadata, stage_init_timeout, use_inline):
+    def _capture_client(model, config, metadata, stage_init_timeout, use_inline, wait_for_ready=True):
         captured.update(
             model=model,
             config=config,
             metadata=metadata,
             stage_init_timeout=stage_init_timeout,
             use_inline=use_inline,
+            wait_for_ready=wait_for_ready,
         )
         return object()
 
@@ -718,6 +719,7 @@ def test_initialize_diffusion_stage_preserves_configured_max_num_seqs(monkeypatc
         "metadata": metadata,
         "stage_init_timeout": 12,
         "use_inline": True,
+        "wait_for_ready": True,
     }
 
 
@@ -815,7 +817,7 @@ def test_initialize_diffusion_stage_does_not_write_max_num_seqs(monkeypatch):
 
     od_config = types.SimpleNamespace(max_num_seqs=8, step_execution=True)
     monkeypatch.setattr(init_mod, "build_diffusion_config", lambda *args: od_config)
-    monkeypatch.setattr(client_mod, "create_diffusion_client", lambda *args: object())
+    monkeypatch.setattr(client_mod, "create_diffusion_client", lambda *args, **kwargs: object())
     metadata = _make_diffusion_metadata(0)
 
     init_mod.initialize_diffusion_stage(

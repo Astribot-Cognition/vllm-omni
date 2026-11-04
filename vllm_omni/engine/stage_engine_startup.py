@@ -1623,6 +1623,11 @@ def launch_diffusion_stage_replica(
     ``StageDiffusionProc`` that heartbeats to ``OmniCoordinator``.
     """
     if omni_master_server is None:
+        # Spawn the subprocess under the process-global spawn-env lock, but wait
+        # for READY outside it: the child loads weights and initializes CUDA
+        # during that wait, so holding the lock there would serialize every
+        # replica's startup. Replicas are placed in separate init groups when
+        # the stage has more than one (see StageRuntime._init_group_key_override).
         with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
             client = initialize_diffusion_stage(
                 metadata.stage_id,
@@ -1631,7 +1636,15 @@ def launch_diffusion_stage_replica(
                 metadata,
                 stage_init_timeout=stage_init_timeout,
                 use_inline=use_inline,
+                wait_for_ready=False,
             )
+        wait_until_started = getattr(client, "wait_until_started", None)
+        if wait_until_started is not None:
+            try:
+                wait_until_started()
+            except Exception:
+                client.shutdown()
+                raise
         return client, StageReplicaResources()
 
     from vllm_omni.diffusion import stage_diffusion_proc

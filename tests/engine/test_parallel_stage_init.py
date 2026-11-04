@@ -169,6 +169,28 @@ def test_init_group_keys_fixed_for_parallel_remote_and_diffusion():
     assert keys == ["parallel:0:0", "parallel:0:1", "remote:1:0", "inline:diffusion"]
 
 
+def test_init_group_keys_multi_replica_diffusion_uses_device_overlap():
+    """Out-of-process diffusion replicas follow normal device-overlap grouping."""
+    runtime = _runtime(parallel_stage_init=False)
+    replicas = []
+    for replica_id, devices in enumerate(("0", "1", "0")):
+        replica = _llm_replica(0, replica_id, devices)
+        replica.metadata.stage_type = "diffusion"
+        replica.num_replicas = 3
+        replicas.append(replica)
+
+    # Distinct GPUs init in parallel; the two replicas sharing GPU 0 stay serial.
+    assert runtime._init_group_keys(replicas) == ["device-group:0", "device-group:1", "device-group:0"]
+
+
+def test_init_group_keys_single_replica_diffusion_stays_inline():
+    runtime = _runtime(parallel_stage_init=False)
+    single = _llm_replica(0, 0, "0")
+    single.metadata.stage_type = "diffusion"
+
+    assert runtime._init_group_keys([single]) == ["inline:diffusion"]
+
+
 def test_unresolved_devices_collapse_serial_groups_and_warn(caplog):
     runtime = _runtime(parallel_stage_init=False)
     with caplog.at_level("WARNING"):
