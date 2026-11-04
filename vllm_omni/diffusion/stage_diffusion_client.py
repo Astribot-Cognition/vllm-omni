@@ -50,8 +50,14 @@ def create_diffusion_client(
     metadata: StageMetadata,
     stage_init_timeout: int,
     use_inline: bool = False,
+    wait_for_ready: bool = True,
 ) -> Any:
-    """Factory to create either an inline or out-of-process diffusion client."""
+    """Factory to create either an inline or out-of-process diffusion client.
+
+    ``wait_for_ready=False`` returns an out-of-process client whose subprocess is
+    already spawned but not yet READY; the caller must call
+    ``client.wait_until_started()`` once it is safe to block.
+    """
     if use_inline:
         from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 
@@ -60,6 +66,7 @@ def create_diffusion_client(
         model=model,
         od_config=od_config,
         stage_init_timeout=stage_init_timeout,
+        wait_until_started=wait_for_ready,
     )
     return StageDiffusionClient.from_addresses(
         metadata,
@@ -521,6 +528,11 @@ class StageDiffusionClient(StageClientBase):
             raise EngineDeadError(
                 f"Stage-{self.stage_id} diffusion subprocess is not alive (exit code: {proc.exitcode})."
             )
+
+    def wait_until_started(self) -> None:
+        """Wait for the owned diffusion subprocess to report READY."""
+        if self._proc_manager is not None:
+            self._proc_manager.wait_until_started()
 
     def shutdown(self) -> None:
         self._shutting_down = True

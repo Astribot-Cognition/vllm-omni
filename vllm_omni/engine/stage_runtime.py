@@ -1187,9 +1187,16 @@ class StageRuntime:
     def _init_group_key_override(self, replica: ReplicaInitPlan) -> str | None:
         """Key that bypasses device-overlap grouping, or ``None`` to use it."""
         if replica.launch_mode == "local" and replica.metadata.stage_type == "diffusion":
-            # Local diffusion process spawning must stay on the orchestrator
-            # thread. Keep all local diffusion replicas in one sequential group.
-            return "inline:diffusion"
+            if replica.num_replicas == 1:
+                # A single local diffusion replica may run inline on the
+                # orchestrator thread; keep it sequential.
+                return "inline:diffusion"
+            # A multi-replica diffusion stage always runs out of process, one
+            # subprocess per replica, so it needs no special key: the normal
+            # device-overlap grouping already lets replicas on distinct GPUs
+            # initialize in parallel while replicas sharing a GPU stay
+            # sequential (see _init_group_keys).
+            return None
         if replica.launch_mode == "remote":
             return f"remote:{replica.metadata.stage_id}:{replica.replica_id}"
         if self._parallel_stage_init:

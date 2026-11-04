@@ -799,6 +799,7 @@ class StageDiffusionProcManager:
         omni_coordinator_address: str | None = None,
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
+        wait_until_started: bool = True,
     ) -> None:
         handshake_address = handshake_address or get_open_zmq_ipc_path()
         addresses = addresses or EngineZmqAddresses(
@@ -827,8 +828,18 @@ class StageDiffusionProcManager:
         self.addresses = addresses
         self.manager_stopped = False
         self.failed_proc_name: str | None = None
+        self._handshake_address = handshake_address
+        self._stage_init_timeout = stage_init_timeout
+        self._startup_ready = False
+        if wait_until_started:
+            self.wait_until_started()
 
-        self._wait_until_started(handshake_address, stage_init_timeout)
+    def wait_until_started(self) -> None:
+        """Block until the subprocess reports READY; safe to call once."""
+        if self._startup_ready:
+            return
+        self._wait_until_started(self._handshake_address, self._stage_init_timeout)
+        self._startup_ready = True
 
     @classmethod
     def launch_headless(
@@ -865,6 +876,9 @@ class StageDiffusionProcManager:
         self.addresses = addresses
         self.manager_stopped = False
         self.failed_proc_name = None
+        self._handshake_address = handshake_address
+        self._stage_init_timeout = 0
+        self._startup_ready = False
         return self
 
     def _wait_until_started(self, handshake_address: str, stage_init_timeout: int) -> None:

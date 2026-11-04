@@ -2089,6 +2089,7 @@ def initialize_diffusion_stage(
     metadata: StageMetadata,
     stage_init_timeout: int,
     use_inline: bool = False,
+    wait_for_ready: bool = True,
 ) -> Any:
     """Build a diffusion stage client.
 
@@ -2098,11 +2099,20 @@ def initialize_diffusion_stage(
         metadata: Extracted stage metadata.
         stage_init_timeout: Timeout in seconds for stage initialization handshake
         use_inline: If True, uses the inline diffusion client instead of subprocess.
+        wait_for_ready: If False, return after spawning the subprocess; the
+            caller waits with ``client.wait_until_started()``.
     """
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
-    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, use_inline)
+    return create_diffusion_client(
+        model,
+        od_config,
+        metadata,
+        stage_init_timeout,
+        use_inline,
+        wait_for_ready=wait_for_ready,
+    )
 
 
 def _stage_declares_cfg_pairs(model_config: Any) -> bool:
