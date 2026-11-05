@@ -4062,10 +4062,27 @@ class Cosmos3OmniDiffusersPipeline(
         if num_frames != 5:
             raise ValueError(f"Cosmos3 edit expects 5 pixel frames, got {num_frames}.")
 
+        reference_images = []
+        for image_tensor in image_tensors:
+            if image_tensor.ndim == 3:
+                image_tensor = image_tensor.unsqueeze(0)
+            if image_tensor.ndim != 4 or image_tensor.shape[0] != 1:
+                raise ValueError(
+                    "Cosmos3 edit batching expects one [1, 3, H, W] reference image per request; "
+                    f"got {tuple(image_tensor.shape)}."
+                )
+            reference_images.append(image_tensor)
+        reference_images = torch.cat(reference_images, dim=0)
+        image_latents = self._encode_conditioning_image_latent(reference_images)
+        if int(image_latents.shape[0]) != len(sp_list):
+            raise ValueError(
+                "Cosmos3 edit batch VAE encode returned a different batch size: "
+                f"{image_latents.shape[0]} vs {len(sp_list)}."
+            )
+
         latents_rows: list[torch.Tensor] = []
-        image_latent_rows: list[torch.Tensor] = []
-        for image_tensor, sp in zip(image_tensors, sp_list, strict=True):
-            image_latent = self._encode_conditioning_image_latent(image_tensor)
+        for index, sp in enumerate(sp_list):
+            image_latent = image_latents[index : index + 1]
             generator = sp.generator
             if isinstance(generator, list):
                 generator = generator[0]
@@ -4085,10 +4102,9 @@ class Cosmos3OmniDiffusersPipeline(
                     target_latents = torch.load(target_latents, map_location="cpu")
                 self._apply_edit_target_latents(latents, target_latents)
             latents_rows.append(latents)
-            image_latent_rows.append(image_latent)
 
         latents = torch.cat(latents_rows, dim=0)
-        image_latent = torch.cat(image_latent_rows, dim=0)
+        image_latent = image_latents
         batch_size = int(latents.shape[0])
         velocity_mask = torch.ones(
             batch_size,
