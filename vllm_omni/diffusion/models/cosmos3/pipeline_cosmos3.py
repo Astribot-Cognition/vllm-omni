@@ -1014,6 +1014,7 @@ class Cosmos3OmniDiffusersPipeline(
     """
 
     support_image_input: ClassVar[bool] = True
+    supports_request_batch: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
     _dit_modules: ClassVar[list[str]] = ["transformer.language_model", "transformer"]
     _encoder_modules: ClassVar[list[str]] = []
@@ -2407,6 +2408,61 @@ class Cosmos3OmniDiffusersPipeline(
 
     # -- Prompt formatting + tokenization (shared by T2V and I2V) ------------
 
+    def _format_and_tokenize_prompts_batch(
+        self,
+        prompts: list[str],
+        negative_prompts: list[str],
+        *,
+        num_frames: int,
+        frame_rate: float,
+        height: int,
+        width: int,
+        max_sequence_length: int,
+        sp_list: list[Any],
+        use_system_prompt: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Format/tokenize a request batch and right-pad to the longest prompt.
+
+        Cosmos3's original single-request path tokenized to each prompt's
+        natural length. Static batching needs one common length; padding tokens
+        are masked out of the GEN cross-attention by the transformer.
+        """
+        cond: list[tuple[torch.Tensor, torch.Tensor]] = []
+        uncond: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for prompt, negative_prompt, sp in zip(prompts, negative_prompts, sp_list, strict=True):
+            cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
+                prompt,
+                negative_prompt,
+                num_frames,
+                frame_rate,
+                height,
+                width,
+                max_sequence_length,
+                sp,
+                use_system_prompt,
+                is_t2i=True,
+                use_resolution_template=True,
+            )
+            cond.append((cond_ids, cond_mask))
+            uncond.append((uncond_ids, uncond_mask))
+
+        def _pad(items: list[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tensor, torch.Tensor]:
+            max_len = max(int(ids.shape[1]) for ids, _ in items)
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = self.tokenizer.eos_token_id or 0
+            ids_out = torch.full((len(items), max_len), int(pad_id), dtype=torch.long, device=self.device)
+            mask_out = torch.zeros((len(items), max_len), dtype=torch.long, device=self.device)
+            for row, (ids, mask) in enumerate(items):
+                length = int(ids.shape[1])
+                ids_out[row, :length] = ids[0]
+                mask_out[row, :length] = mask[0]
+            return ids_out, mask_out
+
+        cond_ids, cond_mask = _pad(cond)
+        uncond_ids, uncond_mask = _pad(uncond)
+        return cond_ids, cond_mask, uncond_ids, uncond_mask
+
     def _format_and_tokenize_prompts(
         self,
         prompt: str,
@@ -3175,8 +3231,8 @@ class Cosmos3OmniDiffusersPipeline(
                     _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
 
             elif do_cfg:
-                cond_cache: tuple = (None, None)
-                uncond_cache: tuple = (None, None)
+                cond_cache: tuple = (None, None, None)
+                uncond_cache: tuple = (None, None, None)
                 keep_uncond_for_cache = self._cache_requires_paired_cfg()
 
                 for step_index, t in enumerate(self.progress_bar(timesteps)):
@@ -3186,7 +3242,11 @@ class Cosmos3OmniDiffusersPipeline(
                     cfg_active = _cfg_active_at(t)
 
                     if not self._kv_load_und(kv_state, is_negative=False):
-                        self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
+                        (
+                            self.transformer.cached_kv,
+                            self.transformer.cached_freqs_gen,
+                            self.transformer.cached_und_mask,
+                        ) = cond_cache
                     noise_cond = self.predict_noise(
                         _cache_context="cond",
                         hidden_states=latents,
@@ -3200,11 +3260,19 @@ class Cosmos3OmniDiffusersPipeline(
                     if kv_state is not None:
                         self._kv_capture_und(kv_state, is_negative=False)
                     elif cond_cache[0] is None:
-                        cond_cache = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
+                        cond_cache = (
+                            self.transformer.cached_kv,
+                            self.transformer.cached_freqs_gen,
+                            self.transformer.cached_und_mask,
+                        )
 
                     if cfg_active or keep_uncond_for_cache:
                         if not self._kv_load_und(kv_state, is_negative=True):
-                            self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
+                            (
+                                self.transformer.cached_kv,
+                                self.transformer.cached_freqs_gen,
+                                self.transformer.cached_und_mask,
+                            ) = uncond_cache
                         noise_uncond = self.predict_noise(
                             _cache_context="uncond",
                             hidden_states=latents,
@@ -3218,7 +3286,11 @@ class Cosmos3OmniDiffusersPipeline(
                         if kv_state is not None:
                             self._kv_capture_und(kv_state, is_negative=True)
                         elif uncond_cache[0] is None:
-                            uncond_cache = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
+                            uncond_cache = (
+                                self.transformer.cached_kv,
+                                self.transformer.cached_freqs_gen,
+                                self.transformer.cached_und_mask,
+                            )
                         # Outside the interval, scale=1.0 makes the combined result
                         # equal to noise_cond; the uncond pass is computed only to
                         # preserve cache-dit's cond/uncond parity.
@@ -3926,11 +3998,181 @@ class Cosmos3OmniDiffusersPipeline(
 
     # -- Forward (main generation entry point) -------------------------------
 
+    def _forward_edit_batch(
+        self,
+        req: DiffusionRequestBatch,
+        pipeline_start: float,
+    ) -> list[DiffusionOutput]:
+        """Static request batch for Cosmos3 image edit.
+
+        This is intentionally narrow: every request must be an edit request
+        with the same canvas/steps/guidance. Text prompts are tokenized
+        independently and right-padded to the longest prompt; the transformer
+        masks the padded K/V positions in the GEN cross-attention.
+        """
+        prompts = list(req.prompts)
+        sp_list = list(req.sampling_params_list)
+        if len(sp_list) != len(prompts):
+            raise ValueError("Cosmos3 edit batch requires one sampling-params entry per prompt.")
+        if self.is_distilled_model:
+            raise ValueError("Cosmos3 edit batching is not supported for distilled checkpoints.")
+
+        image_tensors: list[Any] = []
+        prompt_texts: list[str] = []
+        negative_prompts: list[str] = []
+        for prompt_data in prompts:
+            if not isinstance(prompt_data, dict):
+                raise ValueError("Cosmos3 edit batching requires dict prompts with multi-modal data.")
+            modalities = prompt_data.get("modalities", [])
+            if isinstance(modalities, str):
+                modalities = [modalities]
+            if "image" not in (modalities or []):
+                raise ValueError("Cosmos3 edit batching requires modalities=['image'] for every request.")
+            additional = prompt_data.get("additional_information") or {}
+            image_tensor = additional.get("preprocessed_image")
+            if image_tensor is None:
+                raise ValueError("Cosmos3 edit batching requires a preprocessed reference image per request.")
+            image_tensors.append(image_tensor)
+            prompt_texts.append(str(prompt_data.get("prompt", "")))
+            negative_prompts.append(str(prompt_data.get("negative_prompt") or ""))
+
+        sp0 = sp_list[0]
+        height = int(sp0.height or 384)
+        width = int(sp0.width or 640)
+        if (height, width) != (384, 640):
+            raise ValueError(f"Cosmos3 edit uses the native 640x384 canvas; got {width}x{height}.")
+        num_frames = 5
+        num_inference_steps = int(sp0.num_inference_steps or 35)
+        guidance_scale = self._resolve_guidance_scale(sp0, 2.5)
+        flow_shift = float(self._get_sp_param(sp0, "flow_shift", 5.0))
+        frame_rate = float(
+            self._get_sp_param(sp0, "resolved_frame_rate")
+            or self._get_sp_param(sp0, "frame_rate")
+            or 24.0
+        )
+        max_sequence_length = int(
+            self._get_sp_param(sp0, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
+            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        )
+        use_system_prompt = bool(self._get_sp_param(sp0, "use_system_prompt", True))
+
+        latent_channels = self.transformer.latent_channel_size
+        latent_height = height // self.vae_scale_factor_spatial
+        latent_width = width // self.vae_scale_factor_spatial
+        if num_frames != 5:
+            raise ValueError(f"Cosmos3 edit expects 5 pixel frames, got {num_frames}.")
+
+        latents_rows: list[torch.Tensor] = []
+        image_latent_rows: list[torch.Tensor] = []
+        for image_tensor, sp in zip(image_tensors, sp_list, strict=True):
+            image_latent = self._encode_conditioning_image_latent(image_tensor)
+            generator = sp.generator
+            if isinstance(generator, list):
+                generator = generator[0]
+            if generator is None:
+                seed = self._resolve_seed(sp, None)
+                generator = torch.Generator(device=self.device).manual_seed(seed)
+            noise = randn_tensor(
+                (1, latent_channels, 1, latent_height, latent_width),
+                generator=generator,
+                device=self.device,
+                dtype=self.sampling_dtype,
+            )
+            latents = torch.cat((image_latent, noise), dim=2)
+            if sp.latents is not None:
+                target_latents = sp.latents
+                if isinstance(target_latents, str):
+                    target_latents = torch.load(target_latents, map_location="cpu")
+                self._apply_edit_target_latents(latents, target_latents)
+            latents_rows.append(latents)
+            image_latent_rows.append(image_latent)
+
+        latents = torch.cat(latents_rows, dim=0)
+        image_latent = torch.cat(image_latent_rows, dim=0)
+        batch_size = int(latents.shape[0])
+        velocity_mask = torch.ones(
+            batch_size,
+            1,
+            2,
+            1,
+            1,
+            device=self.device,
+            dtype=self.sampling_dtype,
+        )
+        velocity_mask[:, :, 0, :, :] = 0.0
+
+        cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts_batch(
+            prompt_texts,
+            negative_prompts,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            height=height,
+            width=width,
+            max_sequence_length=max_sequence_length,
+            sp_list=sp_list,
+            use_system_prompt=use_system_prompt,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._num_timesteps = num_inference_steps
+        self._set_flow_shift(flow_shift)
+        self._set_timesteps(
+            num_inference_steps,
+            device=self.device,
+            shift=self._current_flow_shift,
+        )
+
+        shared_kwargs = dict(
+            video_shape=(2, latent_height, latent_width),
+            fps=frame_rate,
+        )
+        shared_kwargs["noisy_frame_mask"] = velocity_mask
+        shared_kwargs["und_vision_tokens"] = image_latent
+
+        latents = self.diffuse(
+            latents=latents,
+            timesteps=self.scheduler.timesteps,
+            cond_ids=cond_ids,
+            cond_mask=cond_mask,
+            uncond_ids=uncond_ids,
+            uncond_mask=uncond_mask,
+            guidance_scale=guidance_scale,
+            shared_kwargs=shared_kwargs,
+            velocity_mask=velocity_mask,
+            image_latent=image_latent,
+            scheduler=self.scheduler,
+            session_id=None,
+            generator=None,
+        )
+        if not isinstance(latents, torch.Tensor):
+            raise ValueError("Cosmos3 edit batch diffusion returned a non-tensor output.")
+        latents = latents[:, :, 1:2]
+        video = self._decode_latents(latents)
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        logger.info(
+            "Cosmos3 edit static batch: B=%d text_len=%d steps=%d total=%.2fs",
+            batch_size,
+            int(cond_ids.shape[1]),
+            num_inference_steps,
+            time.time() - pipeline_start,
+        )
+        return [
+            DiffusionOutput(
+                output={"image": video[row : row + 1]},
+                stage_durations=stage_durations,
+            )
+            for row in range(batch_size)
+        ]
+
     def forward(
         self,
         req: DiffusionRequestBatch,
     ) -> DiffusionOutput:
         pipeline_start = time.time()
+
+        # Experimental static request batching for Cosmos3 image edit.
+        if req.num_reqs > 1:
+            return self._forward_edit_batch(req, pipeline_start)
 
         # --- Parse request ---
         prompt_data = req.prompts[0] if req.prompts else ""

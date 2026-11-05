@@ -750,12 +750,18 @@ class Cosmos3CrossAttention(nn.Module):
         v: torch.Tensor,
         k_und: torch.Tensor,
         v_und: torch.Tensor,
+        und_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S_gen = q.shape[:2]
         k_all = torch.cat([k_und, k], dim=1)
         v_all = torch.cat([v_und, v], dim=1)
 
-        out = self.attn(q, k_all, v_all)
+        attn_metadata = None
+        if und_mask is not None:
+            gen_mask = torch.ones(B, S_gen, dtype=torch.bool, device=q.device)
+            key_mask = torch.cat([und_mask.to(device=q.device), gen_mask], dim=1)
+            attn_metadata = AttentionMetadata.for_cross_kv_mask(key_mask)
+        out = self.attn(q, k_all, v_all, attn_metadata)
         return out.reshape(B, S_gen, -1)
 
     # -- SP path: framework Attention with joint_key/value -------------------
@@ -767,6 +773,7 @@ class Cosmos3CrossAttention(nn.Module):
         v: torch.Tensor,
         k_und: torch.Tensor,
         v_und: torch.Tensor,
+        und_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S_gen = q.shape[:2]
 
@@ -784,9 +791,11 @@ class Cosmos3CrossAttention(nn.Module):
                 padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
                 gen_mask = torch.ones(B, padded_seq_len, dtype=torch.bool, device=q.device)
                 gen_mask[:, ctx.sp_original_seq_len :] = False
-                # UND K/V are trimmed to the common real text length before GEN
-                # attention, so every remaining joint key is valid.
-                joint_mask = torch.ones(B, k_und.shape[1], dtype=torch.bool, device=q.device)
+                # UND K/V may contain right-padding from static batching.
+                if und_mask is None:
+                    joint_mask = torch.ones(B, k_und.shape[1], dtype=torch.bool, device=q.device)
+                else:
+                    joint_mask = und_mask.to(device=q.device)
 
         attn_metadata = AttentionMetadata(
             attn_mask=gen_mask,
@@ -865,6 +874,7 @@ class Cosmos3CrossAttention(nn.Module):
         freqs_sin: torch.Tensor,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
+        und_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -901,9 +911,9 @@ class Cosmos3CrossAttention(nn.Module):
                 control_weights,
             )
         elif _is_sp_active():
-            out = self._forward_sp(q, k, v, k_und, v_und)
+            out = self._forward_sp(q, k, v, k_und, v_und, und_mask=und_mask)
         else:
-            out = self._forward_local(q, k, v, k_und, v_und)
+            out = self._forward_local(q, k, v, k_und, v_und, und_mask=und_mask)
 
         return self.to_out(out)
 
@@ -1023,6 +1033,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
+        und_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if cached_kv is not None:
             if self.layer_idx is None:
@@ -1044,6 +1055,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             freqs_sin=freqs_sin,
             control_token_sizes=control_token_sizes,
             control_weights=control_weights,
+            und_mask=und_mask,
         )
         hidden_states = self._add_residual(hidden_states, residual)
 
@@ -1482,6 +1494,9 @@ class Cosmos3VFMTransformer(nn.Module):
         # Cached state (populated on first forward, reused across denoising steps)
         self.cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self.cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Per-row validity mask for the cached UND K/V. None means every
+        # cached position is valid (single request or equal-length batch).
+        self.cached_und_mask: torch.Tensor | None = None
 
         self._model_cpu_offload_enabled = False
         self._model_cpu_offload_device: torch.device | None = None
@@ -1721,6 +1736,19 @@ class Cosmos3VFMTransformer(nn.Module):
                 )
                 t_pos, _ = compute_mrope_position_ids_text(real_len, temporal_offset=text_start_offset)
                 und_pos_ids = torch.cat([und_v_pos, t_pos], dim=1)
+                if und_pos_ids.shape[1] < und_v_pos.shape[1] + S_text:
+                    und_pos_ids = torch.cat(
+                        [
+                            und_pos_ids,
+                            torch.zeros(
+                                3,
+                                S_text - real_len,
+                                dtype=und_pos_ids.dtype,
+                                device=und_pos_ids.device,
+                            ),
+                        ],
+                        dim=1,
+                    )
                 media_temporal_offset = text_start_offset + real_len + self.temporal_modality_margin
             else:
                 t_pos, text_end_offset = compute_mrope_position_ids_text(real_len, temporal_offset=0)
@@ -1805,6 +1833,7 @@ class Cosmos3VFMTransformer(nn.Module):
     def reset_cache(self) -> None:
         self.cached_kv = None
         self.cached_freqs_gen = None
+        self.cached_und_mask = None
 
     def sound_latent_frames_for_sequence_parallel(
         self,
@@ -1864,6 +1893,7 @@ class Cosmos3VFMTransformer(nn.Module):
         layer_kwargs = {
             "control_token_sizes": control_token_sizes,
             "control_weights": control_weights,
+            "und_mask": self.cached_und_mask,
         }
         if len(self.gen_layers) == len(self.cached_kv):
             for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
@@ -2012,13 +2042,9 @@ class Cosmos3VFMTransformer(nn.Module):
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
         text_lengths = text_mask.sum(dim=1)
-        min_real_len = int(text_lengths.min().item())
         max_real_len = int(text_lengths.max().item())
-        if min_real_len != max_real_len:
-            raise ValueError(
-                f"Cosmos3 requires identical real text lengths within a batch "
-                f"(got min={min_real_len}, max={max_real_len})."
-            )
+        if max_real_len <= 0:
+            raise ValueError("Cosmos3 UND text mask has no real tokens.")
         has_action = action_latents is not None
         has_sound = sound_latents is not None
         if control_latents is None:
@@ -2155,11 +2181,26 @@ class Cosmos3VFMTransformer(nn.Module):
                         text_hidden = self.language_model.embed_tokens(text_ids[:, :max_real_len])
                         hidden_und = torch.cat([und_vision_hidden, text_hidden], dim=1)
                         self.cached_kv = self.language_model.forward_embeds(hidden_und, freqs_und)
+                        vision_len = int(und_vision_hidden.shape[1])
+                        und_mask = torch.cat(
+                            [
+                                torch.ones(
+                                    int(text_mask.shape[0]),
+                                    vision_len,
+                                    dtype=torch.bool,
+                                    device=text_mask.device,
+                                ),
+                                text_mask[:, :max_real_len].bool(),
+                            ],
+                            dim=1,
+                        )
                     else:
                         cached_kv_full = self.language_model(text_ids, freqs_und)
                         # Trim to real text length (remove padding).  K/V stay replicated;
                         # the framework Attention layer head-slices them via joint_key/value.
                         self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+                        und_mask = text_mask[:, :max_real_len].bool()
+                    self.cached_und_mask = None if bool(und_mask.all()) else und_mask
 
         with self._offload_context("generator"):
             # Patchify latents and project to hidden space after UND cache
