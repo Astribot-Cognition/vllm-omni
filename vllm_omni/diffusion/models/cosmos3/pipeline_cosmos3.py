@@ -1990,6 +1990,32 @@ class Cosmos3OmniDiffusersPipeline(
         return "image" in (modalities or [])
 
     @staticmethod
+    def _validate_edit_batch_prompts(prompts: list[Any]) -> None:
+        """Reject non-edit requests before entering the edit-only batch path."""
+        if not prompts:
+            raise ValueError("Cosmos3 request-level batching requires at least one prompt.")
+        for prompt_data in prompts:
+            if not isinstance(prompt_data, dict):
+                raise ValueError(
+                    "Cosmos3 request-level batching currently supports image-edit requests only; "
+                    "run non-edit requests with max_num_seqs=1."
+                )
+            modalities = prompt_data.get("modalities", [])
+            if isinstance(modalities, str):
+                modalities = [modalities]
+            if "image" not in (modalities or []):
+                raise ValueError(
+                    "Cosmos3 request-level batching currently supports image-edit requests only; "
+                    "run non-edit requests with max_num_seqs=1."
+                )
+            additional = prompt_data.get("additional_information") or {}
+            if additional.get("preprocessed_image") is None:
+                raise ValueError(
+                    "Cosmos3 request-level batching requires a preprocessed reference image per request; "
+                    "run requests without a reference image with max_num_seqs=1."
+                )
+
+    @staticmethod
     def _apply_edit_target_latents(
         latents: torch.Tensor,
         target_latents: torch.Tensor | None,
@@ -4014,6 +4040,7 @@ class Cosmos3OmniDiffusersPipeline(
         sp_list = list(req.sampling_params_list)
         if len(sp_list) != len(prompts):
             raise ValueError("Cosmos3 edit batch requires one sampling-params entry per prompt.")
+        self._validate_edit_batch_prompts(prompts)
         if self.is_distilled_model:
             raise ValueError("Cosmos3 edit batching is not supported for distilled checkpoints.")
 
