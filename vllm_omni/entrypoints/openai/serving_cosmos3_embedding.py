@@ -30,7 +30,7 @@ from vllm_omni.entrypoints.openai.diffusion import (
     apply_stage_default_sampling_params,
 )
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
-from vllm_omni.entrypoints.openai.images.helpers import _load_input_images, _update_if_not_none
+from vllm_omni.entrypoints.openai.images.helpers import _load_input_images
 from vllm_omni.entrypoints.openai.protocol.embeddings import (
     Cosmos3EmbeddingRequest,
     Cosmos3EmbeddingResponse,

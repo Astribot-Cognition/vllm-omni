@@ -177,11 +177,13 @@ from vllm_omni.entrypoints.openai.rollout_session import (
 )
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_cosmos3_embedding import (
     COSMOS3_MODEL_CLASS,
+)
+from vllm_omni.entrypoints.openai.serving_cosmos3_embedding import (
     router as cosmos3_embedding_router,
 )
+from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (

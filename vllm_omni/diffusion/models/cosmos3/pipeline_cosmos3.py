@@ -4112,9 +4112,7 @@ class Cosmos3OmniDiffusersPipeline(
         guidance_scale = self._resolve_guidance_scale(sp0, 2.5)
         flow_shift = float(self._get_sp_param(sp0, "flow_shift", 5.0))
         frame_rate = float(
-            self._get_sp_param(sp0, "resolved_frame_rate")
-            or self._get_sp_param(sp0, "frame_rate")
-            or 24.0
+            self._get_sp_param(sp0, "resolved_frame_rate") or self._get_sp_param(sp0, "frame_rate") or 24.0
         )
         max_sequence_length = int(
             self._get_sp_param(sp0, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
