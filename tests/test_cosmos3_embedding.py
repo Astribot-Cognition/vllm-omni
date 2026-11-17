@@ -18,7 +18,10 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+    Cosmos3OmniDiffusersPipeline,
+    get_cosmos3_post_process_func,
+)
 from vllm_omni.diffusion.output_formatter import (
     DiffusionPostprocessOutput,
     _format_single_prompt_output,
@@ -28,6 +31,8 @@ from vllm_omni.entrypoints.openai.protocol.embeddings import (
     Cosmos3EmbeddingRequest,
     EmbeddingEncodingFormat,
 )
+
+pytestmark = [pytest.mark.cpu, pytest.mark.advanced_model]
 
 LATENT_CHANNELS = 48
 PATCH_SIZE = 2
@@ -88,6 +93,17 @@ def test_latent_to_embedding_round_trips_through_unpatchify() -> None:
     tokens = embedding.permute(0, 2, 3, 4, 1).reshape(1, PATCH_H * PATCH_W, PATCH_CHANNELS)
     restored = _TinyTransformer().patchify(latents, 1, LATENT_H, LATENT_W)
     assert torch.equal(tokens, restored)
+
+
+def test_postprocess_passes_latent_payload_through() -> None:
+    postprocess = get_cosmos3_post_process_func(
+        SimpleNamespace(model_class_name="Cosmos3OmniDiffusersPipeline", model_config={})
+    )
+    tensor = torch.randn(1, PATCH_CHANNELS, 1, PATCH_H, PATCH_W)
+    output = {"latent": tensor}
+    sampling_params = SimpleNamespace(output_type="latent")
+
+    assert postprocess(output, sampling_params=sampling_params) is output
 
 
 def test_wants_latent_output_reads_output_type() -> None:

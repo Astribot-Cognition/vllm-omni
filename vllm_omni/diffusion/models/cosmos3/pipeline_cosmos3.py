@@ -808,7 +808,10 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         output_type: str = "np",
         sampling_params=None,
     ):
-        if output_type == "latent":
+        latent_requested = output_type == "latent" or (
+            sampling_params is not None and getattr(sampling_params, "output_type", None) == "latent"
+        )
+        if latent_requested:
             return output
 
         def _postprocess_action(action: Any, metadata: dict[str, Any]) -> Any:

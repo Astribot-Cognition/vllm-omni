@@ -12,12 +12,12 @@ OpenAI-compatible embedding.
 
 from __future__ import annotations
 
-import base64
 import random
 import time
 from collections.abc import Mapping
 from typing import Any
 
+import pybase64
 import torch
 from fastapi import APIRouter, HTTPException, Request
 from vllm.logger import init_logger
@@ -211,7 +211,7 @@ async def _create_embedding(
     )
     payload = source_latent.detach().to(torch.float32).contiguous().cpu().numpy()
     if request.encoding_format == EmbeddingEncodingFormat.BASE64:
-        encoded: list[float] | str = base64.b64encode(payload.tobytes()).decode("ascii")
+        encoded: list[float] | str = pybase64.b64encode(payload.tobytes()).decode("ascii")
     else:
         encoded = payload.reshape(-1).tolist()
 
