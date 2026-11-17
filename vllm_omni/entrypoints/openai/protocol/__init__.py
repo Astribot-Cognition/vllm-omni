@@ -2,6 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionStreamResponse
+from vllm_omni.entrypoints.openai.protocol.embeddings import (
+    Cosmos3EmbeddingRequest,
+    Cosmos3EmbeddingResponse,
+    EmbeddingData,
+    EmbeddingEncodingFormat,
+    EmbeddingUsage,
+)
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageEditARDeltaChunk,
@@ -20,6 +27,11 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 )
 
 __all__ = [
+    "Cosmos3EmbeddingRequest",
+    "Cosmos3EmbeddingResponse",
+    "EmbeddingData",
+    "EmbeddingEncodingFormat",
+    "EmbeddingUsage",
     "ImageData",
     "ImageEditARDeltaChunk",
     "ImageEditImageChunk",

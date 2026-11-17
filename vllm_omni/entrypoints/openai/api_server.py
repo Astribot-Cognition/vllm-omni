@@ -178,6 +178,10 @@ from vllm_omni.entrypoints.openai.rollout_session import (
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
+from vllm_omni.entrypoints.openai.serving_cosmos3_embedding import (
+    COSMOS3_MODEL_CLASS,
+    router as cosmos3_embedding_router,
+)
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
@@ -407,6 +411,13 @@ async def omni_run_server_worker(
         get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
         od_config = get_od_config() if callable(get_od_config) else None
         model_class_name = getattr(od_config, "model_class_name", None) or getattr(args, "model_class_name", None)
+        if model_class_name == COSMOS3_MODEL_CLASS:
+            # Upstream vLLM registers /v1/embeddings for pooling models and
+            # raises NotImplementedError when no pooling handler is attached.
+            # Cosmos3 serves pre-VAE-decode latent embeddings on that path, so
+            # replace the upstream route with the Cosmos3 handler.
+            remove_route_from_app(app, "/v1/embeddings", {"POST"})
+            app.include_router(cosmos3_embedding_router)
         if model_class_name == "SeedVR2Pipeline":
             from vllm_omni.diffusion.models.seedvr2.long_video import register_routes
 

@@ -2419,6 +2419,42 @@ class Cosmos3OmniDiffusersPipeline(
         video = self.vae.decode(latents, return_dict=False)[0]
         return video
 
+    # -- Pre-decode embedding -------------------------------------------------
+
+    @staticmethod
+    def _wants_latent_output(sampling_params: Any) -> bool:
+        """Whether the caller asked for the pre-VAE-decode latent instead of media."""
+        return getattr(sampling_params, "output_type", None) == "latent"
+
+    def _latent_to_embedding(self, latents: torch.Tensor) -> torch.Tensor:
+        """Re-lay-out ``[B, C, T, H, W]`` latents as ``[B, p*p*C, T, H/p, W/p]``.
+
+        This is the DiT patch view of the final latent: ``patchify`` packs every
+        ``p x p x C`` neighbourhood into one token, and this reshapes the
+        ``[B, T*hp*wp, p*p*C]`` tokens back to channel-first. Values are not
+        changed, only their layout.
+        """
+        batch, _, t, h, w = latents.shape
+        p = self.transformer.latent_patch_size
+        hp = (h + p - 1) // p
+        wp = (w + p - 1) // p
+        tokens = self.transformer.patchify(latents, t, h, w)
+        expected = t * hp * wp
+        if tokens.shape[1] != expected:
+            raise ValueError(f"Cosmos3 patchify produced {tokens.shape[1]} tokens, expected {expected}.")
+        return tokens.reshape(batch, t, hp, wp, -1).permute(0, 4, 1, 2, 3).contiguous()
+
+    def _latent_diffusion_output(
+        self,
+        latents: torch.Tensor,
+        stage_durations: dict[str, float] | None,
+    ) -> DiffusionOutput:
+        """Wrap the final pre-decode latent for a latent-output request."""
+        return DiffusionOutput(
+            output={"latent": self._latent_to_embedding(latents)},
+            stage_durations=stage_durations,
+        )
+
     def _decode_sound_latents(
         self,
         sound_latents: torch.Tensor,
@@ -4190,7 +4226,6 @@ class Cosmos3OmniDiffusersPipeline(
         if not isinstance(latents, torch.Tensor):
             raise ValueError("Cosmos3 edit batch diffusion returned a non-tensor output.")
         latents = latents[:, :, 1:2]
-        video = self._decode_latents(latents)
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
         logger.info(
             "Cosmos3 edit static batch: B=%d text_len=%d steps=%d total=%.2fs",
@@ -4199,13 +4234,25 @@ class Cosmos3OmniDiffusersPipeline(
             num_inference_steps,
             time.time() - pipeline_start,
         )
-        return [
-            DiffusionOutput(
-                output={"image": video[row : row + 1]},
-                stage_durations=stage_durations,
+        # Latent-output rows (embedding requests) skip VAE decode; image rows
+        # decode from the same batch so mixed batches stay correct.
+        latent_rows = [row for row, sp in enumerate(sp_list) if self._wants_latent_output(sp)]
+        image_rows = [row for row in range(batch_size) if row not in latent_rows]
+        video = self._decode_latents(latents[image_rows]) if image_rows else None
+        outputs: list[DiffusionOutput] = []
+        image_slot = 0
+        for row in range(batch_size):
+            if row in latent_rows:
+                outputs.append(self._latent_diffusion_output(latents[row : row + 1], stage_durations))
+                continue
+            outputs.append(
+                DiffusionOutput(
+                    output={"image": video[image_slot : image_slot + 1]},
+                    stage_durations=stage_durations,
+                )
             )
-            for row in range(batch_size)
-        ]
+            image_slot += 1
+        return outputs
 
     def forward(
         self,
@@ -4674,6 +4721,13 @@ class Cosmos3OmniDiffusersPipeline(
             # source frame together with the target makes frame 1 look like a
             # blend of the source and the result.
             latents = latents[:, :, 1:2]
+        if self._wants_latent_output(sp):
+            if sound_enabled or action_enabled:
+                raise ValueError("Cosmos3 latent output supports video-only requests, not sound or action generation.")
+            return self._latent_diffusion_output(
+                latents,
+                self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
         video = self._decode_latents(latents)
         if _is_rank_zero():
             logger.info("Video decoded in %.2fs", time.time() - decode_start)

@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, TypeGuard, cast
 
+import torch
+
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import get_diffusion_output_type, supports_audio_output
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
@@ -315,6 +317,26 @@ def _format_single_prompt_output(
                 metrics=metrics,
                 multimodal_output=mm_output,
                 final_output_type="text",
+                stage_durations=diffusion_output.stage_durations,
+                peak_memory_mb=diffusion_output.peak_memory_mb,
+                finished=finished,
+            ),
+        ]
+
+    # Latent-output requests (e.g. Cosmos3 pre-VAE-decode embeddings) return a
+    # tensor instead of media; keep it on the request output's ``latents``
+    # field so serving handlers can serialize it without image decoding.
+    latent_payload = postprocess_output.outputs.get("latent")
+    if isinstance(latent_payload, torch.Tensor):
+        return [
+            OmniRequestOutput.from_diffusion(
+                request_id=request_id,
+                images=[],
+                prompt=prompt,
+                metrics=metrics,
+                latents=latent_payload,
+                multimodal_output=mm_output or None,
+                final_output_type="latents",
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
                 finished=finished,
