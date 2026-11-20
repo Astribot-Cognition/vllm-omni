@@ -966,6 +966,44 @@ def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
 
 
 # ---------------------------------------------------------------------------
+# Manual CUDA graphs
+# ---------------------------------------------------------------------------
+def validate_manual_cuda_graphs(od_config: Any, device: torch.device, resolved_offload: Any) -> None:
+    """Reject configurations the Cosmos3 graph capture cannot represent."""
+    parallel = getattr(od_config, "parallel_config", None)
+    cache_backend = getattr(od_config, "cache_backend", None)
+    quantization = getattr(od_config, "quantization_config", None)
+    unsupported = (
+        device.type != "cuda"
+        or parallel is None
+        or getattr(parallel, "world_size", 1) != 1
+        or getattr(parallel, "use_hsdp", False)
+        or resolved_offload.strategy is not OffloadStrategy.NONE
+        or cache_backend not in (None, "none", "sea_cache")
+        or (
+            quantization is not None
+            and (
+                quantization.get_name() != "modelopt"
+                or not getattr(quantization, "is_checkpoint_fp8_serialized", False)
+            )
+        )
+        or getattr(od_config, "lora_path", None) is not None
+        or getattr(od_config, "enable_sleep_mode", False)
+        or (
+            not getattr(od_config, "enforce_eager", True)
+            and getattr(od_config, "diffusion_compile_granularity", "regional") != "regional"
+        )
+        or getattr(od_config, "diffusion_attention_schedule", None) is not None
+    )
+    if unsupported:
+        raise ValueError(
+            "Cosmos3 manual CUDA graphs require a single resident CUDA GPU with eager execution or "
+            "regional compilation, no offload, LoRA, sleep mode or attention schedule, a cache backend "
+            "of none or sea_cache, and unquantized or serialized ModelOpt FP8 weights."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 class Cosmos3OmniDiffusersPipeline(
@@ -1146,6 +1184,15 @@ class Cosmos3OmniDiffusersPipeline(
             sound_latent_fps=sound_latent_fps,
         )
         self.is_edge_model = transformer_cls is Cosmos3EdgeVFMTransformer
+
+        use_manual_cuda_graphs = (getattr(od_config, "additional_config", None) or {}).get(
+            "cosmos3_manual_cuda_graphs", False
+        )
+        if not isinstance(use_manual_cuda_graphs, bool):
+            raise ValueError("cosmos3_manual_cuda_graphs must be a boolean")
+        if use_manual_cuda_graphs:
+            validate_manual_cuda_graphs(od_config, self.device, resolved_offload)
+            self.transformer.enable_cuda_graphs(self.device)
 
         # Opt-in: route the per-CFG-branch UND text K/V through the shared
         # SessionStateManager (RFC #4480) instead of the transformer-instance
@@ -4777,3 +4824,4 @@ class Cosmos3OmniDiffusersPipeline(
             sampling_params=sp,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
+

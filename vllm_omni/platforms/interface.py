@@ -168,6 +168,16 @@ class OmniPlatform(Platform):
         return True
 
     @classmethod
+    def get_graphed_forward_cls(cls) -> type:
+        """Return the CUDA-graph replay wrapper class for this platform."""
+        raise NotImplementedError(f"{cls.__name__} does not provide a graphed forward wrapper")
+
+    @classmethod
+    def is_graph_capturing(cls) -> bool:
+        """Whether this process is inside an outer CUDA-graph capture."""
+        return False
+
+    @classmethod
     def has_flash_attn_package(cls) -> bool:
         """Check if a Flash Attention package is available and usable on this platform."""
         return False

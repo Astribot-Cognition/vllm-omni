@@ -12,6 +12,7 @@ Ported from the TRT-LLM integration (tekit branch user/shreyasm/cosmos3).
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -1492,6 +1493,9 @@ class Cosmos3VFMTransformer(nn.Module):
         self.gen_sp_gather = nn.Identity()
 
         # Cached state (populated on first forward, reused across denoising steps)
+        self._und_graph: Any | None = None
+        self._und_vision_graph: Any | None = None
+        self._gen_graph: Any | None = None
         self.cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self.cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
         # Per-row validity mask for the cached UND K/V. None means every
@@ -1867,11 +1871,60 @@ class Cosmos3VFMTransformer(nn.Module):
             embedding = self.time_embedder((timestep * self.timestep_scale).float())
         return embedding.to(dtype)
 
+    def enable_cuda_graphs(self, device: torch.device) -> None:
+        """Capture the UND tower and the packed GEN stack for a resident GPU."""
+        graph_cls = current_omni_platform.get_graphed_forward_cls()
+        self._und_graph = graph_cls(self.language_model, device=device, name="Cosmos3 UND")
+        if os.environ.get("COSMOS3_GRAPH_UND_VISION", "1") not in ("", "0"):
+            self._und_vision_graph = graph_cls(
+                self._graph_und_vision_forward, device=device, name="Cosmos3 UND vision"
+            )
+        self._gen_graph = graph_cls(
+            self._graph_gen_forward,
+            device=device,
+            name="Cosmos3 GEN",
+            max_entries=8,
+            batch_input_copies=True,
+        )
+
+    def _graph_und_vision_forward(
+        self,
+        *,
+        hidden_und: torch.Tensor,
+        freqs: tuple[torch.Tensor, torch.Tensor],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """UND tower over ``[reference vision | text]`` embeddings for edit mode."""
+        return self.language_model.forward_embeds(hidden_und, freqs)
+
+    def _graph_gen_forward(
+        self,
+        *,
+        hidden: torch.Tensor,
+        kv: list[tuple[torch.Tensor, torch.Tensor]],
+        freqs: tuple[torch.Tensor, torch.Tensor],
+        control_token_sizes: tuple[int, ...] | None = None,
+        control_weights: tuple[float, ...] | None = None,
+        gather_output: bool = True,
+    ) -> torch.Tensor:
+        # Conditioning and control metadata are explicit inputs so a replay
+        # cannot reuse another CFG branch's K/V or another request's controls.
+        return self.norm_moe_gen(
+            self._run_gen_layers(
+                hidden,
+                cached_kv=kv,
+                freqs_gen=freqs,
+                control_token_sizes=control_token_sizes,
+                control_weights=control_weights,
+                gather_output=gather_output,
+            )
+        )
+
     def _run_gen_layers(
         self,
         hidden_gen: torch.Tensor,
         *,
         freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         gather_output: bool = True,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
@@ -1885,7 +1938,9 @@ class Cosmos3VFMTransformer(nn.Module):
         """
         # UND K/V stay replicated; Cosmos3CrossAttention supplies them as
         # joint_key/value for Ulysses head-slicing in the attention backend.
-        if self.cached_kv is None:
+        if cached_kv is None:
+            cached_kv = self.cached_kv
+        if cached_kv is None:
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
         if freqs_gen is None:
             hidden_gen, freqs_gen = self._shard_gen_inputs(hidden_gen)
@@ -1895,8 +1950,8 @@ class Cosmos3VFMTransformer(nn.Module):
             "control_weights": control_weights,
             "und_mask": self.cached_und_mask,
         }
-        if len(self.gen_layers) == len(self.cached_kv):
-            for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
+        if len(self.gen_layers) == len(cached_kv):
+            for layer, (k_und, v_und) in zip(self.gen_layers, cached_kv, strict=True):
                 hidden_gen = layer(
                     hidden_gen,
                     k_und=k_und,
@@ -1911,9 +1966,7 @@ class Cosmos3VFMTransformer(nn.Module):
         else:
             # Cache-dit patches gen_layers to a grouped wrapper.
             for layer in self.gen_layers:
-                hidden_gen = layer(
-                    hidden_gen, cached_kv=self.cached_kv, freqs_gen=(freqs_cos, freqs_sin), **layer_kwargs
-                )
+                hidden_gen = layer(hidden_gen, cached_kv=cached_kv, freqs_gen=(freqs_cos, freqs_sin), **layer_kwargs)
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
         return self.gen_sp_gather(hidden_gen) if gather_output else hidden_gen
@@ -2180,7 +2233,10 @@ class Cosmos3VFMTransformer(nn.Module):
                     if und_vision_hidden is not None:
                         text_hidden = self.language_model.embed_tokens(text_ids[:, :max_real_len])
                         hidden_und = torch.cat([und_vision_hidden, text_hidden], dim=1)
-                        self.cached_kv = self.language_model.forward_embeds(hidden_und, freqs_und)
+                        if self._und_vision_graph is None:
+                            self.cached_kv = self.language_model.forward_embeds(hidden_und, freqs_und)
+                        else:
+                            self.cached_kv = self._und_vision_graph(hidden_und=hidden_und, freqs=freqs_und)
                         vision_len = int(und_vision_hidden.shape[1])
                         und_mask = torch.cat(
                             [
@@ -2195,7 +2251,10 @@ class Cosmos3VFMTransformer(nn.Module):
                             dim=1,
                         )
                     else:
-                        cached_kv_full = self.language_model(text_ids, freqs_und)
+                        if self._und_graph is None:
+                            cached_kv_full = self.language_model(text_ids, freqs_und)
+                        else:
+                            cached_kv_full = self._und_graph(text_ids=text_ids, freqs=freqs_und)
                         # Trim to real text length (remove padding).  K/V stay replicated;
                         # the framework Attention layer head-slices them via joint_key/value.
                         self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
@@ -2303,6 +2362,22 @@ class Cosmos3VFMTransformer(nn.Module):
         """Execute the cacheable GEN stack, including final norm."""
         if prep.freqs_gen is None:
             raise RuntimeError("Cosmos3 GEN inputs must go through _shard_gen_prep before the stack.")
+        if self._gen_graph is not None:
+            return self._gen_graph(
+                # The mixed-precision schedule changes Python dispatch inside
+                # the linears, so each active mode needs its own graph.
+                variant=(
+                    self.mixed_precision_runtime.use_high_precision("generation")
+                    if self.mixed_precision_runtime is not None
+                    else None
+                ),
+                hidden=prep.hidden_gen,
+                kv=self.cached_kv,
+                freqs=prep.freqs_gen,
+                control_token_sizes=prep.multi_control_token_sizes,
+                control_weights=prep.multi_control_weights,
+                gather_output=not prep.use_multi_control_attention and not prep.defer_gen_gather,
+            )
         hidden_gen = self._run_gen_layers(
             prep.hidden_gen,
             freqs_gen=prep.freqs_gen,

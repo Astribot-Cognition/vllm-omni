@@ -380,6 +380,12 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         return True
 
     @classmethod
+    def get_graphed_forward_cls(cls) -> type:
+        from vllm_omni.diffusion.cuda_graph import GraphedForward
+
+        return GraphedForward
+
+    @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
         if local_rank is None:
             return torch.device("cuda")
