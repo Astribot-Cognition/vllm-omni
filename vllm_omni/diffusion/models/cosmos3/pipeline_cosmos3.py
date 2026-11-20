@@ -163,6 +163,9 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+# Modes already told about the reduced compile/CUDA-graph coverage.
+_OPTIMIZATION_SCOPE_WARNED: set[str] = set()
+
 
 COSMOS3_DEFAULT_CONDITION_PIXEL_FRAMES = (
     max(COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION) * COSMOS3_VAE_TEMPORAL_COMPRESSION + 1
@@ -1190,6 +1193,7 @@ class Cosmos3OmniDiffusersPipeline(
         )
         if not isinstance(use_manual_cuda_graphs, bool):
             raise ValueError("cosmos3_manual_cuda_graphs must be a boolean")
+        self._manual_cuda_graphs = bool(use_manual_cuda_graphs)
         if use_manual_cuda_graphs:
             validate_manual_cuda_graphs(od_config, self.device, resolved_offload)
             self.transformer.enable_cuda_graphs(self.device)
@@ -4256,6 +4260,7 @@ class Cosmos3OmniDiffusersPipeline(
         shared_kwargs["noisy_frame_mask"] = velocity_mask
         shared_kwargs["und_vision_tokens"] = image_latent
 
+        self._warn_optimization_scope("generation")
         latents = self.diffuse(
             latents=latents,
             timesteps=self.scheduler.timesteps,
@@ -4302,6 +4307,20 @@ class Cosmos3OmniDiffusersPipeline(
             image_slot += 1
         return outputs
 
+    def _warn_optimization_scope(self, mode: str) -> None:
+        """Warn once when a request leaves the edit path graphs and compile target."""
+        if mode in _OPTIMIZATION_SCOPE_WARNED:
+            return
+        compiled = not bool(getattr(self.od_config, "enforce_eager", True))
+        if not (compiled or getattr(self, "_manual_cuda_graphs", False)):
+            return
+        _OPTIMIZATION_SCOPE_WARNED.add(mode)
+        logger.warning(
+            "Cosmos3 compile/CUDA-graph are validated for image edit and edit embeddings only; "
+            "%s requests keep running but lose the tuned capture shapes and may re-capture graphs.",
+            mode,
+        )
+
     def forward(
         self,
         req: DiffusionRequestBatch,
@@ -4320,6 +4339,7 @@ class Cosmos3OmniDiffusersPipeline(
         sp = req.sampling_params
         robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data, getattr(req, "request_id", None))
         if robolab_inputs is not None:
+            self._warn_optimization_scope("robolab policy")
             return self._forward_robolab_policy(
                 sp,
                 robolab_inputs,
@@ -4410,6 +4430,7 @@ class Cosmos3OmniDiffusersPipeline(
                 raise ValueError("Cosmos3 transfer inference accepts video inputs or control_path values, not images.")
             if transfer_video_tensor is None and video_tensor is not None:
                 transfer_video_tensor = video_tensor
+            self._warn_optimization_scope("transfer")
             return self._forward_transfer(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
