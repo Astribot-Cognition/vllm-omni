@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import math
+import contextlib
 import os
 import time
 from collections.abc import Iterable, Mapping
@@ -1009,6 +1010,35 @@ def validate_manual_cuda_graphs(od_config: Any, device: torch.device, resolved_o
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _vae_strict_flags():
+    """Run a VAE call in IEEE fp32 with deterministic cuDNN, then restore the flags.
+
+    The TF32 switches are process-global, so they are scoped to the VAE call:
+    the transformer keeps whatever precision policy the rest of the engine set.
+    """
+    previous = (
+        torch.backends.cudnn.allow_tf32,
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+    )
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    try:
+        yield
+    finally:
+        (
+            torch.backends.cudnn.allow_tf32,
+            torch.backends.cuda.matmul.allow_tf32,
+            torch.backends.cudnn.deterministic,
+            torch.backends.cudnn.benchmark,
+        ) = previous
+
+
 class Cosmos3OmniDiffusersPipeline(
     nn.Module,
     CFGParallelMixin,
@@ -1147,6 +1177,13 @@ class Cosmos3OmniDiffusersPipeline(
         # Cosmos3 VAE weights are bf16, while the diffusers reference upcasts
         # them to fp32 for compute. ``model_config["vae_dtype"]`` selects the
         # compute dtype without changing the transformer.
+        import os as _os
+
+        self._vae_strict = bool(od_config.model_config.get("vae_strict", False)) or _os.environ.get(
+            "COSMOS3_VAE_STRICT", ""
+        ) not in ("", "0")
+        if self._vae_strict:
+            logger.info("Cosmos3 VAE strict mode: TF32 disabled for VAE calls only")
         vae_dtype = _resolve_vae_dtype(od_config)
         self.vae = DistributedAutoencoderKLWan.from_pretrained(
             model_path,
@@ -2470,7 +2507,9 @@ class Cosmos3OmniDiffusersPipeline(
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
             latents = latents / scaling_factor
 
-        video = self.vae.decode(latents, return_dict=False)[0]
+        _cm = _vae_strict_flags() if getattr(self, "_vae_strict", False) else contextlib.nullcontext()
+        with _cm:
+            video = self.vae.decode(latents, return_dict=False)[0]
         return video
 
     # -- Pre-decode embedding -------------------------------------------------
@@ -2739,8 +2778,16 @@ class Cosmos3OmniDiffusersPipeline(
         work for repeated frames that are later replaced by noise.
         """
         image_tensor = self._to_vae_device(image_tensor, pin_cpu=True)
+        if self._vae_strict:
+            # Re-assert per call: other components may flip the global TF32 flags.
+            torch.backends.cudnn.allow_tf32 = False
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
         video = image_tensor.unsqueeze(2)
-        latent = self.vae.encode(video).latent_dist.mode()
+        _cm = _vae_strict_flags() if self._vae_strict else contextlib.nullcontext()
+        with _cm:
+            latent = self.vae.encode(video).latent_dist.mode()
         latent = self._normalize_vae_latent(latent)
         return latent[:, :, 0:1, :, :].to(self.sampling_dtype)
 
