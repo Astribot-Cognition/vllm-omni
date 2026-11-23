@@ -2778,12 +2778,6 @@ class Cosmos3OmniDiffusersPipeline(
         work for repeated frames that are later replaced by noise.
         """
         image_tensor = self._to_vae_device(image_tensor, pin_cpu=True)
-        if self._vae_strict:
-            # Re-assert per call: other components may flip the global TF32 flags.
-            torch.backends.cudnn.allow_tf32 = False
-            torch.backends.cuda.matmul.allow_tf32 = False
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
         video = image_tensor.unsqueeze(2)
         _cm = _vae_strict_flags() if self._vae_strict else contextlib.nullcontext()
         with _cm:
