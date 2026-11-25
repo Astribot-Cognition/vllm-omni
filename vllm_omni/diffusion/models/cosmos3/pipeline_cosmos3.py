@@ -1009,6 +1009,11 @@ def validate_manual_cuda_graphs(od_config: Any, device: torch.device, resolved_o
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
+
+# --- alignment harness: shared reference latent (experiment only) ----------
+_ALIGN_LATENT_INDEX = {"value": 0}
+# ---------------------------------------------------------------------------
+
 class Cosmos3OmniDiffusersPipeline(
     nn.Module,
     CFGParallelMixin,
@@ -2739,6 +2744,18 @@ class Cosmos3OmniDiffusersPipeline(
         work for repeated frames that are later replaced by noise.
         """
         image_tensor = self._to_vae_device(image_tensor, pin_cpu=True)
+        import os as _os
+
+        _shared_dir = _os.environ.get("COSMOS3_ALIGN_LATENT", "")
+        if _shared_dir and tuple(image_tensor.shape[-2:]) == (384, 640):
+            import numpy as _np
+
+            index = _ALIGN_LATENT_INDEX["value"]
+            _ALIGN_LATENT_INDEX["value"] = index + 1
+            array = _np.load(f"{_shared_dir}/latent-{index:03d}.npy")
+            if _os.environ.get("COSMOS3_ALIGN_TRACE", ""):
+                print(f"ALIGN[latent_inject] index={index} norm={float(_np.linalg.norm(array)):.6f}", flush=True)
+            return torch.from_numpy(array).to(device=image_tensor.device, dtype=self.sampling_dtype)
         video = image_tensor.unsqueeze(2)
         latent = self.vae.encode(video).latent_dist.mode()
         latent = self._normalize_vae_latent(latent)

@@ -640,6 +640,34 @@ class Cosmos3CausalAttention(nn.Module):
         return self.to_out(out), k, v
 
 
+
+# --- alignment harness: env-gated precision switches (experiment only) ------
+_ALIGN_FEATURES = frozenset(
+    part.strip() for part in __import__("os").environ.get("COSMOS3_ALIGN", "").split(",") if part.strip()
+)
+_ALIGN_TRACE: set[str] = set()
+
+
+def _align(name: str) -> bool:
+    return name in _ALIGN_FEATURES
+
+
+def _model_dtype(transformer) -> "torch.dtype":
+    """The compute dtype the transformer runs in (independent of the proj weights)."""
+    return transformer.norm_moe_gen.weight.dtype
+
+
+def _align_trace(label: str, *tensors) -> None:
+    """Print dtypes once per process when COSMOS3_ALIGN_TRACE is set."""
+    import os as _os
+
+    if not _os.environ.get("COSMOS3_ALIGN_TRACE", "") or label in _ALIGN_TRACE:
+        return
+    _ALIGN_TRACE.add(label)
+    dtypes = " ".join(str(t.dtype) if hasattr(t, "dtype") else repr(t) for t in tensors)
+    print(f"ALIGN[{label}] {dtypes}", flush=True)
+# ---------------------------------------------------------------------------
+
 class Cosmos3CrossAttention(nn.Module):
     """Generation pathway: full attention where visual Q attends to all K/V.
 
@@ -886,6 +914,9 @@ class Cosmos3CrossAttention(nn.Module):
             freqs_sin: [B, S_gen_local, 1, D]
         """
         B, S_gen, _ = hidden_states.shape
+        # The GEN residual stream may be fp32 (``residual``/``mlp``/``proj``);
+        # projections keep the weight dtype so matmuls stay bf16 like diffusers.
+        hidden_states = hidden_states.to(self.to_q.weight.dtype)
 
         q = self.to_q(hidden_states).view(B, S_gen, self.num_heads_local, self.head_dim)
         k = self.to_k(hidden_states).view(B, S_gen, self.num_kv_heads_local, self.head_dim)
@@ -895,9 +926,18 @@ class Cosmos3CrossAttention(nn.Module):
         if self.qk_norm:
             q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
             k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
+        if _align("qknorm"):
+            q = q.float()
+            k = k.float()
+            _align_trace("gen_attn_qk_fp32", q, k)
 
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+        if _align("qknorm"):
+            # diffusers feeds fp32 q/k into SDPA; our kernel needs the compute dtype.
+            q = q.to(v.dtype)
+            k = k.to(v.dtype)
+        _align_trace("gen_attn", hidden_states, q, k, v)
 
         if control_token_sizes is not None or control_weights is not None:
             if control_token_sizes is None or control_weights is None:
@@ -1045,8 +1085,15 @@ class Cosmos3GenDecoderLayer(nn.Module):
         if k_und is None or v_und is None or freqs_cos is None or freqs_sin is None:
             raise ValueError("Cosmos3 GEN layer requires k_und/v_und/freqs_cos/freqs_sin.")
 
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # ``residual`` mirrors diffusers: bf16 residual stream, fp32 norm output,
+        # cast to the weight dtype at every matmul.
+        # ``stream_fp32``/``mlp``/``proj`` keep the residual stream itself in fp32.
+        faithful_norm = _align("residual")
+        fp32_stream = _align("stream_fp32") or _align("mlp")
+        residual = hidden_states.float() if fp32_stream else hidden_states
+        hidden_states = self.input_layernorm(residual)
+        if fp32_stream or faithful_norm:
+            hidden_states = hidden_states.float()
 
         hidden_states = self.cross_attention(
             hidden_states,
@@ -1059,9 +1106,18 @@ class Cosmos3GenDecoderLayer(nn.Module):
             und_mask=und_mask,
         )
         hidden_states = self._add_residual(hidden_states, residual)
+        _align_trace("gen_layer_after_attn", hidden_states)
 
         residual = hidden_states
-        hidden_states = self._add_residual(self._forward_mlp(hidden_states), residual)
+        if _align("mlp"):
+            hidden_states = self._add_residual(self._forward_mlp(residual.float()), residual)
+        else:
+            # The MLP keeps bf16 weights, so the fp32 norm output is cast at this
+            # boundary exactly like diffusers' autocast does.
+            hidden_states = self._add_residual(
+                self._forward_mlp(hidden_states.to(self.mlp.gate_proj.weight.dtype)), residual
+            )
+        _align_trace("gen_layer_out", hidden_states)
 
         return hidden_states
 
@@ -2204,7 +2260,11 @@ class Cosmos3VFMTransformer(nn.Module):
             und_vision_grid = (1, hp, wp)
             if need_kv:
                 with self._offload_context("generator"):
-                    und_vision_hidden = self.proj_in(self.patchify(und_vision_tokens, 1, h, w))
+                    # diffusers scatters these tokens into a bf16 buffer, so the
+                    # fp32 proj_in output is cast back to the model dtype here.
+                    und_vision_hidden = self.proj_in(
+                        self.patchify(und_vision_tokens, 1, h, w).to(self.proj_in.weight.dtype)
+                    ).to(_model_dtype(self))
 
         # Run UND pathway once and cache K/V (replicated across all ranks).
         # freqs_gen (M-RoPE cos/sin) is derived purely from shape/fps and is
@@ -2265,7 +2325,10 @@ class Cosmos3VFMTransformer(nn.Module):
             # Patchify latents and project to hidden space after UND cache
             # construction, so model-level offload does not stage GEN weights
             # before immediately swapping to the reasoner.
-            hidden_video = self.proj_in(self.patchify(hidden_states, t, h, w))
+            hidden_video = self.proj_in(self.patchify(hidden_states, t, h, w).to(self.proj_in.weight.dtype)).to(
+                _model_dtype(self)
+            )
+            _align_trace("proj_in", hidden_video)
             s_video = hidden_video.shape[1]
             s_control = 0
             hidden_controls: list[torch.Tensor] = []
@@ -2276,8 +2339,10 @@ class Cosmos3VFMTransformer(nn.Module):
                         f"control[{idx}]={tuple(control.shape)}, target={tuple(hidden_states.shape)}."
                     )
                 hidden_control = self.proj_in(
-                    self.patchify(control.to(device=hidden_states.device, dtype=hidden_states.dtype), t, h, w)
-                )
+                    self.patchify(control.to(device=hidden_states.device, dtype=hidden_states.dtype), t, h, w).to(
+                        self.proj_in.weight.dtype
+                    )
+                ).to(_model_dtype(self))
                 hidden_controls.append(hidden_control)
                 s_control += hidden_control.shape[1]
             control_token_sizes = tuple(control.shape[1] for control in hidden_controls)
@@ -2397,7 +2462,7 @@ class Cosmos3VFMTransformer(nn.Module):
         if prep.defer_gen_gather:
             hidden_gen = self.gen_sp_gather(hidden_gen)
         if not prep.has_action and not prep.has_sound and not prep.has_control:
-            return self.unpatchify(self.proj_out(hidden_gen), prep.t, prep.h, prep.w)
+            return self.unpatchify(self.proj_out(hidden_gen.to(self.proj_out.weight.dtype)), prep.t, prep.h, prep.w)
 
         split_sizes = []
         if prep.has_control:
@@ -2413,7 +2478,7 @@ class Cosmos3VFMTransformer(nn.Module):
             split_idx += 1
         hidden_video = split_hidden[split_idx]
         split_idx += 1
-        video_pred = self.unpatchify(self.proj_out(hidden_video), prep.t, prep.h, prep.w)
+        video_pred = self.unpatchify(self.proj_out(hidden_video.to(self.proj_out.weight.dtype)), prep.t, prep.h, prep.w)
         if prep.has_control:
             return video_pred
 
@@ -2431,6 +2496,12 @@ class Cosmos3VFMTransformer(nn.Module):
     def post_load_weights(self) -> None:
         """Post-load processing: ensure correct dtypes."""
         self.time_embedder.to(torch.float32)
+        if _align("proj"):
+            self.proj_in.to(torch.float32)
+            self.proj_out.to(torch.float32)
+        if _align("mlp"):
+            for _layer in self.gen_layers:
+                _layer.mlp.to(torch.float32)
 
     def set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
         if self.mixed_precision_runtime is not None:
