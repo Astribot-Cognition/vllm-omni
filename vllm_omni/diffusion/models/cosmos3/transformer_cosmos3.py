@@ -1146,8 +1146,11 @@ class Cosmos3LanguageModel(nn.Module):
             if release_completed_blocks_to_meta:
                 release_module_parameters_to_meta(layer)
             self.layers.append(layer)
-        # TODO: Not used right now, will be used in the future for prompt upsampler.
+        # Generation never reads the reasoner output, but the readout heads are
+        # trained on its final hidden state, so serving needs it on demand.
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.capture_hidden = False
+        self.last_hidden: torch.Tensor | None = None
 
     def forward(
         self,
@@ -1179,6 +1182,8 @@ class Cosmos3LanguageModel(nn.Module):
         for layer in self.layers:
             hidden, k, v = layer(hidden, freqs)
             cached_kv.append((k, v))
+        if self.capture_hidden:
+            self.last_hidden = self.norm(hidden)
         return cached_kv
 
 

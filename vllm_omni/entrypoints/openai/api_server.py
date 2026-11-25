@@ -141,6 +141,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _check_max_generated_image_size,
     _choose_output_format,
     _extract_images_from_result,
+    _extract_readouts_from_result,
     _generated_size_str,
     _get_max_edit_input_images,
     _load_input_images,
@@ -2367,6 +2368,9 @@ async def edit_images(
     true_cfg_scale: float | None = Form(None),
     seed: int | None = Form(None),
     generator_device: str | None = Form(None),
+    # vllm-omni extension: decode the trained box/waypoint heads from the
+    # first generation forward. Requires an export that carries readout/.
+    return_readouts: bool = Form(False),
     # vllm-omni extension for per-request LoRA.
     lora: str | None = Form(None),  # Json string
     # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
@@ -2551,6 +2555,8 @@ async def edit_images(
             system_prompt=system_prompt,
         )
         extra_args.update(edit_extra_args)
+        if return_readouts:
+            extra_args["return_readouts"] = True
         if extra_args:
             gen_params.extra_args = extra_args
 
@@ -2559,6 +2565,7 @@ async def edit_images(
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
         logger.debug(f"Generating {n} image(s) {size_str}")
 
+        readouts = None
         if len(stage_configs) > 1:
             # Multi-stage pipeline (e.g. GLM-Image AR+Diffusion): route through
             # the chat handler so the AR stage gets correct max_tokens and
@@ -2657,6 +2664,7 @@ async def edit_images(
                 request_id=request_id,
             )
             images = _extract_images_from_result(result)
+            readouts = _extract_readouts_from_result(result) if return_readouts else None
             stage_durations = getattr(result, "stage_durations", None)
             peak_memory_mb = getattr(result, "peak_memory_mb", None)
             response_metrics = getattr(result, "metrics", None) if return_stage_metrics else None
@@ -2665,6 +2673,10 @@ async def edit_images(
             images = []
         logger.debug(f"Successfully generated {len(images)} image(s)")
 
+        # Readouts describe one sample; multi-image requests keep the field null.
+        if readouts is not None and len(images) != 1:
+            readouts = None
+
         # Encode images to base64
         image_data = [
             ImageData(
@@ -2672,6 +2684,7 @@ async def edit_images(
                     img, format=output_format, output_compression=output_compression
                 ),
                 revised_prompt=None,
+                readouts=readouts,
             )
             for img in images
         ]

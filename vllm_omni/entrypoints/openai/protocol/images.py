@@ -210,6 +210,11 @@ class ImageData(BaseModel):
     b64_json: str | None = Field(default=None, description="Base64-encoded PNG image")
     url: str | None = Field(default=None, description="Image URL (not implemented)")
     revised_prompt: str | None = Field(default=None, description="Revised prompt (OpenAI compatibility, always null)")
+    readouts: dict[str, Any] | None = Field(
+        default=None,
+        description="Cosmos3 readout heads: normalized place/pick boxes and left/right waypoints. "
+        "Only present when the request asks for readouts and the served export carries the heads.",
+    )
 
 
 class ImageGenerationResponse(BaseModel):

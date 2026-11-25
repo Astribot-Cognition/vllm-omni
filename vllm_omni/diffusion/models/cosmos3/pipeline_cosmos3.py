@@ -119,6 +119,7 @@ from .transfer import (
     transfer_max_frames_from_extra_args,
     uint8_cthw_to_normalized_5d,
 )
+from .readout import ReadoutConfig, ReadoutHeads, readout_payload
 from .transformer_cosmos3 import Cosmos3VFMTransformer, _tf_config_get, resolve_sound_gen
 from .transformer_cosmos3_edge import COSMOS3_EDGE_BACKBONE_TYPE, Cosmos3EdgeVFMTransformer
 from .utils import (
@@ -1255,6 +1256,22 @@ class Cosmos3OmniDiffusersPipeline(
             ),
         ]
 
+        # Optional readout heads exported next to the transformer. They decode
+        # boxes/waypoints from the first generation forward, so they are loaded
+        # like any other component: a head file that is missing after the loader
+        # ran is a startup error, never a silently random head.
+        self.readout = self._build_readout_heads(model_path)
+        if self.readout is not None:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=model_path,
+                    subfolder="readout",
+                    revision=None,
+                    prefix="readout.",
+                    fall_back_to_pt=True,
+                )
+            )
+
         # An engine-level override becomes the video default; otherwise use
         # the matching regular/Edge default. Per-request values still take
         # precedence.
@@ -1478,6 +1495,85 @@ class Cosmos3OmniDiffusersPipeline(
                     "Use an action-capable transformer checkpoint."
                 )
         return loaded
+
+    def _build_readout_heads(self, model_path: Any) -> ReadoutHeads | None:
+        """Build exported readout heads, or ``None`` when the export carries none."""
+        config_path = os.path.join(str(model_path), "readout", "config.json")
+        if not os.path.isfile(config_path):
+            return None
+        config = ReadoutConfig.from_path(config_path)
+        heads = ReadoutHeads(config, int(self.transformer.hidden_size)).to(self.device)
+        heads.eval()
+        return heads
+
+    def _readout_requested(self, sampling_params: Any) -> bool:
+        return bool(self._get_sp_param(sampling_params, "return_readouts", False))
+
+    def _begin_readout_capture(self) -> dict[str, Any]:
+        """Capture the first generation forward's tower outputs for readout decoding.
+
+        The first forward already runs at the first sigma against the reference
+        frame with the request noise, which is the state the heads were trained
+        on; reusing it keeps ``return_readouts`` free of an extra transformer pass.
+        """
+        if self.readout is None:
+            raise ValueError(
+                "This Cosmos3 export has no readout heads; export a checkpoint that "
+                "carries readout/config.json."
+            )
+        if getattr(self.transformer, "_und_vision_graph", None) is not None or getattr(
+            self.transformer, "_und_graph", None
+        ) is not None:
+            raise ValueError(
+                "Cosmos3 readouts need the understanding tower's final hidden state, which "
+                "manual CUDA graphs do not expose; serve with graphs disabled."
+            )
+        language_model = self.transformer.language_model
+        state: dict[str, Any] = {"gen": None, "pending": True}
+
+        def capture_gen(_module: Any, _inputs: Any, output: Any) -> None:
+            if state["pending"]:
+                state["pending"] = False
+                state["gen"] = output.detach()
+
+        state["handle"] = self.transformer.norm_moe_gen.register_forward_hook(capture_gen)
+        state["language_model"] = language_model
+        language_model.last_hidden = None
+        language_model.capture_hidden = True
+        return state
+
+    def _end_readout_capture(self, state: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor] | None:
+        state["handle"].remove()
+        language_model = state["language_model"]
+        language_model.capture_hidden = False
+        und_hidden = language_model.last_hidden
+        language_model.last_hidden = None
+        gen_hidden = state["gen"]
+        if und_hidden is None or gen_hidden is None:
+            return None
+        return und_hidden, gen_hidden
+
+    def _readout_body(
+        self,
+        captured: tuple[torch.Tensor, torch.Tensor],
+        *,
+        video_shape: tuple[int, int, int],
+        text_len: int,
+    ) -> dict[str, Any]:
+        """Decode one sample of head outputs into the response payload."""
+        und_hidden, gen_hidden = captured
+        _, latent_h, latent_w = video_shape
+        grid_h, grid_w, _, _ = self.transformer._pad_to_patch_size(int(latent_h), int(latent_w))
+        # Heads keep the FP32 precision they were trained in.
+        self.readout.to(dtype=torch.float32)
+        with torch.autocast(self.device.type, dtype=self.dtype):
+            boxes, waypoints = self.readout.decode(
+                und_hidden=und_hidden,
+                gen_hidden=gen_hidden,
+                vision_grid=(grid_h, grid_w),
+                text_len=text_len,
+            )
+        return readout_payload(self.readout.config, boxes, waypoints)
 
     def predict_noise(self, **kwargs) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Override CFGParallelMixin.predict_noise for Cosmos3.
@@ -4699,6 +4795,13 @@ class Cosmos3OmniDiffusersPipeline(
         W_latent = latents.shape[4]
         video_shape = (T_latent, H_latent, W_latent)
 
+        # Readouts decode the first generation forward of an edit request. They
+        # are requested per call because the extra head work is not free for
+        # clients that only want pixels.
+        serve_readouts = bool(is_edit) and self._readout_requested(sp)
+        readout_text_len = int(cond_mask.sum())
+        captured_readouts: tuple[torch.Tensor, torch.Tensor] | None = None
+
         sound_latents = None
         target_audio_samples = None
         sound_sample_rate = None
@@ -4770,7 +4873,12 @@ class Cosmos3OmniDiffusersPipeline(
                 samples.append(_run_diffusion(next_latents))
             latents = torch.cat(samples, dim=0)
         else:
-            diffusion_output = _run_diffusion(latents)
+            readout_capture = self._begin_readout_capture() if serve_readouts else None
+            try:
+                diffusion_output = _run_diffusion(latents)
+            finally:
+                if readout_capture is not None:
+                    captured_readouts = self._end_readout_capture(readout_capture)
             if action_enabled and sound_enabled:
                 latents, action_latents, sound_latents = diffusion_output
             elif action_enabled:
@@ -4834,6 +4942,26 @@ class Cosmos3OmniDiffusersPipeline(
                             "action_mode": action_mode,
                             "domain_id": domain_id,
                         },
+                    },
+                },
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+
+        if serve_readouts:
+            if captured_readouts is None:
+                raise ValueError(
+                    "Cosmos3 readout capture produced no hidden states; the first generation "
+                    "forward did not run the understanding and generation towers."
+                )
+            return DiffusionOutput(
+                output={
+                    "payload": {"image": video},
+                    "metadata": {
+                        "readouts": self._readout_body(
+                            captured_readouts,
+                            video_shape=video_shape,
+                            text_len=readout_text_len,
+                        )
                     },
                 },
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,

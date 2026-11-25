@@ -22,6 +22,7 @@ See ``images/README.md`` (utils vs helpers, no overlap).
 """
 
 import io
+from collections.abc import Mapping
 from http import HTTPStatus
 from numbers import Integral
 from typing import Any
@@ -168,6 +169,18 @@ def _extract_images_from_result(result: Any) -> list[Any]:
         else:
             flattened.append(img)
     return [_normalize_image(img) for img in flattened]
+
+
+def _extract_readouts_from_result(result: Any) -> dict[str, Any] | None:
+    """Return the readout payload a Cosmos3 pipeline attached to the request, if any."""
+    multimodal = getattr(result, "multimodal_output", None)
+    if not isinstance(multimodal, Mapping):
+        return None
+    metadata = multimodal.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    readouts = metadata.get("readouts")
+    return dict(readouts) if isinstance(readouts, Mapping) else None
 
 
 def _generated_size_str(images: list[Any], fallback: str | None) -> str | None:
