@@ -1558,12 +1558,27 @@ class Cosmos3OmniDiffusersPipeline(
         captured: tuple[torch.Tensor, torch.Tensor],
         *,
         video_shape: tuple[int, int, int],
-        text_len: int,
     ) -> dict[str, Any]:
-        """Decode one sample of head outputs into the response payload."""
+        """Decode one sample of head outputs into the response payload.
+
+        The text length is read from the captured understanding hidden state
+        because the prompt template hides some tokens from the text embedding;
+        the request mask is not the right measure, and the heads are trained on
+        the token layout the towers actually produced.
+        """
         und_hidden, gen_hidden = captured
         _, latent_h, latent_w = video_shape
         grid_h, grid_w, _, _ = self.transformer._pad_to_patch_size(int(latent_h), int(latent_w))
+        vision_tokens = grid_h * grid_w
+        text_len = int(und_hidden.shape[1]) - vision_tokens
+        expected_gen = 2 * vision_tokens
+        if text_len < 0 or int(gen_hidden.shape[1]) != expected_gen:
+            raise ValueError(
+                "Cosmos3 readout layout mismatch: "
+                f"und_tokens={int(und_hidden.shape[1])}, gen_tokens={int(gen_hidden.shape[1])}, "
+                f"vision_grid=({grid_h}, {grid_w}) implies {vision_tokens} vision tokens "
+                f"and {expected_gen} generation tokens."
+            )
         # Heads keep the FP32 precision they were trained in.
         self.readout.to(dtype=torch.float32)
         with torch.autocast(self.device.type, dtype=self.dtype):
@@ -4799,7 +4814,6 @@ class Cosmos3OmniDiffusersPipeline(
         # are requested per call because the extra head work is not free for
         # clients that only want pixels.
         serve_readouts = bool(is_edit) and self._readout_requested(sp)
-        readout_text_len = int(cond_mask.sum())
         captured_readouts: tuple[torch.Tensor, torch.Tensor] | None = None
 
         sound_latents = None
@@ -4960,7 +4974,6 @@ class Cosmos3OmniDiffusersPipeline(
                         "readouts": self._readout_body(
                             captured_readouts,
                             video_shape=video_shape,
-                            text_len=readout_text_len,
                         )
                     },
                 },
