@@ -1182,7 +1182,11 @@ class Cosmos3LanguageModel(nn.Module):
         for layer in self.layers:
             hidden, k, v = layer(hidden, freqs)
             cached_kv.append((k, v))
-        if self.capture_hidden:
+        # Latch the first forward: the caller re-runs the reasoner for every
+        # later forward of the request, including the unconditional branch that
+        # classifier-free guidance adds, and the heads were trained on the
+        # conditional branch's output.
+        if self.capture_hidden and self.last_hidden is None:
             self.last_hidden = self.norm(hidden)
         return cached_kv
 

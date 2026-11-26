@@ -5,15 +5,18 @@
 
 The heads decode boxes/waypoints from LumoWorld's joint checkpoint; these tests
 cover the parts that do not need a checkpoint: the exported recipe contract, the
-token layout the heads assume, and the response serialization.
+token layout the heads assume, which forward the serving pipeline captures, and
+the response serialization.
 """
 
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 import torch
+from torch import nn
 
 from vllm_omni.diffusion.models.cosmos3.readout import (
     ReadoutConfig,
@@ -153,3 +156,32 @@ def test_payload_serves_one_sample_per_request() -> None:
     config = tiny_config()
     with pytest.raises(ValueError, match="one sample per request"):
         readout_payload(config, torch.zeros(2, 2, 5), torch.zeros(2, 2, config.waypoint_steps, 2))
+
+
+class _PassthroughReasonerLayer(nn.Module):
+    """Stands in for a decoder layer so the capture logic can run without attention."""
+
+    def forward(self, hidden: torch.Tensor, freqs: Any) -> tuple[torch.Tensor, None, None]:
+        return hidden, None, None
+
+
+def test_reasoner_capture_keeps_the_first_forward() -> None:
+    # Local import: importing the transformer pulls in the CUDA attention stack.
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3LanguageModel, RMSNorm
+
+    model = object.__new__(Cosmos3LanguageModel)
+    nn.Module.__init__(model)
+    model.layers = nn.ModuleList([_PassthroughReasonerLayer()])
+    model.norm = RMSNorm(4, eps=1e-6)
+    model.capture_hidden = True
+    model.last_hidden = None
+    conditional = torch.randn(1, 3, 4)
+    unconditional = torch.randn(1, 3, 4)
+
+    model.forward_embeds(conditional, freqs=None)
+    model.forward_embeds(unconditional, freqs=None)
+
+    # Classifier-free guidance re-runs the reasoner on the unconditional branch
+    # after the conditional one; the heads belong to the conditional output.
+    assert model.last_hidden is not None
+    torch.testing.assert_close(model.last_hidden, model.norm(conditional), rtol=0, atol=0)
