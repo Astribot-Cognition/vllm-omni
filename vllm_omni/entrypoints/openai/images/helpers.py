@@ -35,7 +35,6 @@ from PIL import Image
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
-from vllm_omni.diffusion.models.cosmos3.readout import readout_config_path
 from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
 
 logger = init_logger(__name__)
@@ -170,26 +169,6 @@ def _extract_images_from_result(result: Any) -> list[Any]:
         else:
             flattened.append(img)
     return [_normalize_image(img) for img in flattened]
-
-
-def _export_has_readout_heads(od_config: Any) -> bool | None:
-    """Whether the served export ships readout heads, or ``None`` when unknowable."""
-    model_path = getattr(od_config, "model", None)
-    if not model_path:
-        return None
-    return readout_config_path(model_path).is_file()
-
-
-def _log_cosmos3_readout_capability(engine_client: Any) -> None:
-    """Log whether the served Cosmos3 export can answer readout requests."""
-    get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
-    od_config = get_od_config() if callable(get_od_config) else None
-    if getattr(od_config, "model_class_name", None) != "Cosmos3OmniDiffusersPipeline":
-        return
-    if _export_has_readout_heads(od_config) is False:
-        logger.info("Cosmos3 readout heads absent; /v1/images/edits rejects return_readouts for this export.")
-    else:
-        logger.info("Cosmos3 readout heads available; /v1/images/edits accepts return_readouts.")
 
 
 def _extract_readouts_from_result(result: Any) -> dict[str, Any] | None:

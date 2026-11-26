@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from PIL import Image
 
@@ -55,6 +55,25 @@ COSMOS3_EXTRA_OUTPUT_PARAMS = frozenset(
         "readouts",
     }
 )
+
+
+ReadoutCapability = Literal["present", "absent", "unknown"]
+
+
+def cosmos3_readout_capability(od_config: Any) -> ReadoutCapability:
+    """Whether the served Cosmos3 export ships the readout heads.
+
+    ``unknown`` means the request cannot be judged here (another model class, or
+    no on-disk model path), so callers must not treat it as absent.
+    """
+    if getattr(od_config, "model_class_name", None) != "Cosmos3OmniDiffusersPipeline":
+        return "unknown"
+    model_path = getattr(od_config, "model", None)
+    if not model_path:
+        return "unknown"
+    from vllm_omni.diffusion.models.cosmos3.readout import readout_config_path
+
+    return "present" if readout_config_path(model_path).is_file() else "absent"
 
 
 def build_image_to_image_prompt(

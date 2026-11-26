@@ -141,9 +141,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _build_hunyuan_edit_extra_args,
     _check_max_generated_image_size,
     _choose_output_format,
-    _export_has_readout_heads,
     _extract_images_from_result,
-    _log_cosmos3_readout_capability,
     _extract_readouts_from_result,
     _generated_size_str,
     _get_max_edit_input_images,
@@ -230,6 +228,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.model_extras.cosmos3 import cosmos3_readout_capability
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -1007,7 +1006,7 @@ async def omni_init_app_state(
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
-        _log_cosmos3_readout_capability(engine_client)
+        _log_readout_capability(engine_client)
         return
 
     # LLM or multi-stage mode: use standard initialization logic
@@ -2344,6 +2343,17 @@ async def generate_images(
     },
 )
 @with_cancellation
+def _log_readout_capability(engine_client: Any) -> None:
+    """Log whether the served export can answer Cosmos3 readout requests."""
+    get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
+    od_config = get_od_config() if callable(get_od_config) else None
+    capability = cosmos3_readout_capability(od_config)
+    if capability == "present":
+        logger.info("Cosmos3 readout heads available; /v1/images/edits accepts return_readouts.")
+    elif capability == "absent":
+        logger.info("Cosmos3 readout heads absent; /v1/images/edits rejects return_readouts for this export.")
+
+
 async def edit_images(
     raw_request: Request,
     image: list[UploadFile] | None = File(None),
@@ -2560,11 +2570,10 @@ async def edit_images(
         )
         extra_args.update(edit_extra_args)
         if return_readouts:
-            if _export_has_readout_heads(_get_diffusion_od_config(raw_request, engine_client)) is False:
-                raise HTTPException(
-                    status_code=HTTPStatus.BAD_REQUEST.value,
-                    detail="The served export carries no readout heads; export a joint checkpoint that "
-                    "includes readout/ to serve return_readouts.",
+            if cosmos3_readout_capability(_get_diffusion_od_config(raw_request, engine_client)) == "absent":
+                raise OmniClientError(
+                    "The served export carries no readout heads; export a joint checkpoint that "
+                    "includes readout/ to serve return_readouts."
                 )
             extra_args["return_readouts"] = True
         if extra_args:
