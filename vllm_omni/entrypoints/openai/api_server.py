@@ -2332,17 +2332,6 @@ async def generate_images(
         )
 
 
-@router.post(
-    "/v1/images/edits",
-    response_model=None,
-    responses={
-        HTTPStatus.OK.value: {"model": ImageGenerationResponse},
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-@with_cancellation
 def _log_readout_capability(engine_client: Any) -> None:
     """Log whether the served export can answer Cosmos3 readout requests."""
     get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
@@ -2354,6 +2343,17 @@ def _log_readout_capability(engine_client: Any) -> None:
         logger.info("Cosmos3 readout heads absent; /v1/images/edits rejects return_readouts for this export.")
 
 
+@router.post(
+    "/v1/images/edits",
+    response_model=None,
+    responses={
+        HTTPStatus.OK.value: {"model": ImageGenerationResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
 async def edit_images(
     raw_request: Request,
     image: list[UploadFile] | None = File(None),
