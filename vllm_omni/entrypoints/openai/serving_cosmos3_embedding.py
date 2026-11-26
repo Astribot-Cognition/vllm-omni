@@ -239,11 +239,9 @@ async def _create_embedding(
     app_state_args = getattr(raw_request.app.state, "args", None)
     default_sampling_params = getattr(app_state_args, "default_sampling_params", None)
     apply_stage_default_sampling_params(default_sampling_params, gen_params, str(image_stage_id))
-    # The joint checkpoint was trained on the bare world-model prompt; the
-    # image-edit endpoint's default system prompt would add conditioning that
-    # dataset feature extraction must not include.
-    gen_params.extra_args = dict(gen_params.extra_args or {})
-    gen_params.extra_args.setdefault("use_system_prompt", False)
+    # Keep the pipeline's prompt defaults: the checkpoint was trained with the
+    # image system prompt and the resolution template, so overriding either one
+    # would return a latent from different text than training produced.
 
     gen_params.width = width
     gen_params.height = height
