@@ -1509,18 +1509,26 @@ class Cosmos3OmniDiffusersPipeline(
     def _readout_requested(self, sampling_params: Any) -> bool:
         return bool(self._get_sp_param(sampling_params, "return_readouts", False))
 
-    def _begin_readout_capture(self) -> dict[str, Any]:
+    def _begin_readout_capture(self) -> dict[str, Any] | None:
         """Capture the first generation forward's tower outputs for readout decoding.
 
         The first forward already runs at the first sigma against the reference
         frame with the request noise, which is the state the heads were trained
         on; reusing it keeps ``return_readouts`` free of an extra transformer pass.
+
+        Returns ``None`` on the ranks that only run the unconditional branch, so
+        the caller has nothing to tear down there.
         """
         if self.readout is None:
             raise ValueError(
                 "This Cosmos3 export has no readout heads; export a checkpoint that "
                 "carries readout/config.json."
             )
+        # CFG parallel keeps the conditional branch on rank 0, which is also the
+        # rank that assembles the response; the other ranks only contribute the
+        # unconditional forward and must not capture or decode.
+        if get_classifier_free_guidance_rank() != 0:
+            return None
         if getattr(self.transformer, "_und_vision_graph", None) is not None or getattr(
             self.transformer, "_und_graph", None
         ) is not None:
@@ -4961,12 +4969,7 @@ class Cosmos3OmniDiffusersPipeline(
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
-        if serve_readouts:
-            if captured_readouts is None:
-                raise ValueError(
-                    "Cosmos3 readout capture produced no hidden states; the first generation "
-                    "forward did not run the understanding and generation towers."
-                )
+        if serve_readouts and captured_readouts is not None:
             return DiffusionOutput(
                 output={
                     "payload": {"image": video},
