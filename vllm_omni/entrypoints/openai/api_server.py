@@ -2575,6 +2575,16 @@ async def edit_images(
                     "The served export carries no readout heads; export a joint checkpoint that "
                     "includes readout/ to serve return_readouts."
                 )
+            # The heads decode into coordinates normalized to the training
+            # content region, which only exist for the training canvas. Anything
+            # else would be silently cover-cropped by the pipeline and decoded
+            # in a geometry the heads never saw.
+            if width is not None and height is not None and pil_images[0].size != (width, height):
+                raise OmniClientError(
+                    f"return_readouts needs the {width}x{height} canvas as the reference image; "
+                    f"got {pil_images[0].width}x{pil_images[0].height}. Resize the content and edge-pad "
+                    "it to the canvas before sending, or drop return_readouts."
+                )
             extra_args["return_readouts"] = True
         if extra_args:
             gen_params.extra_args = extra_args

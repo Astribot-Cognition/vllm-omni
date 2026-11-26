@@ -187,7 +187,9 @@ data: [DONE]
 
 A Cosmos3 export that carries `readout/` can answer `return_readouts=true` with the
 normalized place/pick boxes and the left/right waypoint trajectories next to the
-image:
+image. The reference image must already be the `size` canvas: the heads decode
+coordinates normalized to the training content region, so a request whose image
+is a different size is rejected with 400 instead of being cover-cropped.
 
 ```json
 {

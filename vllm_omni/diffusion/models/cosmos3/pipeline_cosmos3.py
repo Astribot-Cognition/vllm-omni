@@ -465,6 +465,11 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
         return torch.stack(processed, dim=1).unsqueeze(0).contiguous()
 
     def _preprocess_condition_image(image: PIL.Image.Image, target_h: int, target_w: int) -> torch.Tensor:
+        # A caller that already built the training canvas (content resized and
+        # edge-padded to the served size) gets no second resample: cover-cropping
+        # it again would change the pixels the model was trained on.
+        if image.size == (target_w, target_h):
+            return video_processor.preprocess(image, height=target_h, width=target_w)
         scale = max(target_w / image.width, target_h / image.height)
         resize_w = int(np.ceil(scale * image.width))
         resize_h = int(np.ceil(scale * image.height))
