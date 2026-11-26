@@ -10,6 +10,8 @@ and the ``/v1/embeddings`` handler with a mocked engine.
 from __future__ import annotations
 
 import base64
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -242,3 +244,39 @@ async def test_handler_rejects_non_native_size(monkeypatch) -> None:
     with pytest.raises(HTTPException) as excinfo:
         await serving._create_embedding(request, _fake_raw_request())
     assert excinfo.value.status_code == 400
+
+
+def _write_export(root: Path, *, width: int, height: int, spatial: int = 16, patch: int = 2) -> None:
+    (root / "vae").mkdir(parents=True, exist_ok=True)
+    (root / "transformer").mkdir(parents=True, exist_ok=True)
+    (root / "export.json").write_text(json.dumps({"width": width, "height": height}))
+    (root / "vae" / "config.json").write_text(json.dumps({"scale_factor_spatial": spatial}))
+    (root / "transformer" / "config.json").write_text(json.dumps({"latent_patch_size": patch}))
+
+
+def test_export_canvas_pads_the_content_to_the_patch_grid(tmp_path) -> None:
+    _write_export(tmp_path, width=640, height=360)
+
+    assert serving._export_canvas(str(tmp_path)) == (640, 384)
+
+
+def test_export_canvas_follows_the_recorded_content_size(tmp_path) -> None:
+    aligned = tmp_path / "aligned"
+    padded = tmp_path / "padded"
+    _write_export(aligned, width=512, height=288)
+    _write_export(padded, width=100, height=60)
+
+    assert serving._export_canvas(str(aligned)) == (512, 288)
+    assert serving._export_canvas(str(padded)) == (128, 64)
+
+
+def test_export_canvas_is_none_without_geometry(tmp_path) -> None:
+    assert serving._export_canvas(str(tmp_path)) is None
+    assert serving._served_canvas(SimpleNamespace(model=str(tmp_path))) == serving.FALLBACK_CANVAS
+    assert serving._served_canvas(SimpleNamespace()) == serving.FALLBACK_CANVAS
+
+
+def test_served_canvas_reads_the_model_export(tmp_path) -> None:
+    _write_export(tmp_path, width=320, height=180)
+
+    assert serving._served_canvas(SimpleNamespace(model=str(tmp_path))) == (320, 192)

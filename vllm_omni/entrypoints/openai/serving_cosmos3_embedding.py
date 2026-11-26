@@ -12,9 +12,12 @@ OpenAI-compatible embedding.
 
 from __future__ import annotations
 
+import json
 import random
 import time
 from collections.abc import Mapping
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import pybase64
@@ -46,11 +49,68 @@ logger = init_logger(__name__)
 router = APIRouter()
 
 COSMOS3_MODEL_CLASS = "Cosmos3OmniDiffusersPipeline"
-# Native Cosmos3 image-edit canvas; the pipeline rejects any other size.
-NATIVE_WIDTH = 640
-NATIVE_HEIGHT = 384
+# Canvas the endpoint falls back to when the served export records no content
+# size; LumoWorld exports record it, plain Cosmos3 checkpoints do not.
+FALLBACK_CANVAS = (640, 384)
 DEFAULT_NUM_INFERENCE_STEPS = 35
 DEFAULT_GUIDANCE_SCALE = 2.5
+
+
+def _read_json(path: Path) -> Any:
+    """Read one exported config, or ``None`` when it is absent or malformed."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+@lru_cache(maxsize=8)
+def _export_canvas(model_path: str) -> tuple[int, int] | None:
+    """Derive the served canvas from an export, or ``None`` when it records none.
+
+    ``export.json`` holds the content size the checkpoint was trained on; the
+    canvas pads that content up to the latent patch grid, i.e. the VAE spatial
+    factor times the DiT patch size. For the native export this yields
+    640x384 from 640x360 content.
+    """
+    root = Path(model_path)
+    manifest = _read_json(root / "export.json")
+    if not isinstance(manifest, Mapping):
+        return None
+    content_width = manifest.get("width")
+    content_height = manifest.get("height")
+    vae_config = _read_json(root / "vae" / "config.json")
+    transformer_config = _read_json(root / "transformer" / "config.json")
+    if not isinstance(content_width, int) or not isinstance(content_height, int):
+        return None
+    if not isinstance(vae_config, Mapping) or not isinstance(transformer_config, Mapping):
+        return None
+    spatial = vae_config.get("scale_factor_spatial")
+    patch = transformer_config.get("latent_patch_size")
+    if not isinstance(spatial, int) or not isinstance(patch, int) or spatial <= 0 or patch <= 0:
+        return None
+    alignment = spatial * patch
+    canvas = (-(-content_width // alignment) * alignment, -(-content_height // alignment) * alignment)
+    logger.info(
+        "Cosmos3 embeddings canvas %dx%d derived from %s (content %dx%d, alignment %d)",
+        canvas[0],
+        canvas[1],
+        root / "export.json",
+        content_width,
+        content_height,
+        alignment,
+    )
+    return canvas
+
+
+def _served_canvas(od_config: Any) -> tuple[int, int]:
+    """Canvas this server accepts for embeddings requests."""
+    model_path = getattr(od_config, "model", None)
+    if isinstance(model_path, str) and model_path:
+        canvas = _export_canvas(model_path)
+        if canvas is not None:
+            return canvas
+    return FALLBACK_CANVAS
 
 
 def _require_cosmos3(engine_client: Any, raw_request: Request) -> Any:
@@ -68,18 +128,18 @@ def _require_cosmos3(engine_client: Any, raw_request: Request) -> Any:
     return od_config
 
 
-def _native_size(request: Cosmos3EmbeddingRequest) -> tuple[int, int]:
-    """Resolve the requested canvas, accepting only the native Cosmos3 edit size."""
+def _native_size(request: Cosmos3EmbeddingRequest, canvas: tuple[int, int]) -> tuple[int, int]:
+    """Resolve the requested canvas, accepting only the served Cosmos3 edit size."""
     if request.size is None:
-        return NATIVE_WIDTH, NATIVE_HEIGHT
+        return canvas
     try:
         width, height = parse_size(request.size)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid size {request.size!r}: {exc}") from exc
-    if (width, height) != (NATIVE_WIDTH, NATIVE_HEIGHT):
+    if (width, height) != canvas:
         raise HTTPException(
             status_code=400,
-            detail=f"Cosmos3 image-edit inference only supports the native {NATIVE_WIDTH}x{NATIVE_HEIGHT} canvas.",
+            detail=f"Cosmos3 image-edit inference only supports the native {canvas[0]}x{canvas[1]} canvas.",
         )
     return width, height
 
@@ -156,7 +216,7 @@ async def _create_embedding(
         )
     od_config = _require_cosmos3(engine_client, raw_request)
 
-    width, height = _native_size(request)
+    width, height = _native_size(request, _served_canvas(od_config))
     try:
         pil_images = await _load_input_images([request.image])
     except ValueError as exc:
