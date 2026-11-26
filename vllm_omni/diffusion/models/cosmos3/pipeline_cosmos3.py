@@ -119,7 +119,7 @@ from .transfer import (
     transfer_max_frames_from_extra_args,
     uint8_cthw_to_normalized_5d,
 )
-from .readout import ReadoutConfig, ReadoutHeads, readout_payload
+from .readout import READOUT_COMPONENT, ReadoutConfig, ReadoutHeads, readout_config_path, readout_payload
 from .transformer_cosmos3 import Cosmos3VFMTransformer, _tf_config_get, resolve_sound_gen
 from .transformer_cosmos3_edge import COSMOS3_EDGE_BACKBONE_TYPE, Cosmos3EdgeVFMTransformer
 from .utils import (
@@ -1265,7 +1265,7 @@ class Cosmos3OmniDiffusersPipeline(
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=model_path,
-                    subfolder="readout",
+                    subfolder=READOUT_COMPONENT,
                     revision=None,
                     prefix="readout.",
                     fall_back_to_pt=True,
@@ -1498,8 +1498,8 @@ class Cosmos3OmniDiffusersPipeline(
 
     def _build_readout_heads(self, model_path: Any) -> ReadoutHeads | None:
         """Build exported readout heads, or ``None`` when the export carries none."""
-        config_path = os.path.join(str(model_path), "readout", "config.json")
-        if not os.path.isfile(config_path):
+        config_path = readout_config_path(model_path)
+        if not config_path.is_file():
             return None
         config = ReadoutConfig.from_path(config_path)
         heads = ReadoutHeads(config, int(self.transformer.hidden_size)).to(self.device)

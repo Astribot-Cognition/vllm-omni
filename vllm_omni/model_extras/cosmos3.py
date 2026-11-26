@@ -52,6 +52,7 @@ COSMOS3_EXTRA_OUTPUT_PARAMS = frozenset(
         "raw_action_dim",
         "domain_id",
         "action_mode",
+        "readouts",
     }
 )
 

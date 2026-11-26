@@ -22,7 +22,6 @@ See ``images/README.md`` (utils vs helpers, no overlap).
 """
 
 import io
-import os
 from collections.abc import Mapping
 from http import HTTPStatus
 from numbers import Integral
@@ -36,6 +35,7 @@ from PIL import Image
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
+from vllm_omni.diffusion.models.cosmos3.readout import readout_config_path
 from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
 
 logger = init_logger(__name__)
@@ -177,7 +177,7 @@ def _export_has_readout_heads(od_config: Any) -> bool | None:
     model_path = getattr(od_config, "model", None)
     if not model_path:
         return None
-    return os.path.isfile(os.path.join(str(model_path), "readout", "config.json"))
+    return readout_config_path(model_path).is_file()
 
 
 def _log_cosmos3_readout_capability(engine_client: Any) -> None:

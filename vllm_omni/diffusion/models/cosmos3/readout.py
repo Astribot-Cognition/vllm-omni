@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Two-query readout heads: place/pick boxes and left/right waypoints.
 
 The heads are trained by LumoWorld's joint AlignVAE world model. They decode the
@@ -25,6 +27,10 @@ from typing import Any
 import torch
 from torch import nn
 
+# On-disk component the exporter writes next to ``transformer/`` and ``vae/``.
+READOUT_COMPONENT = "readout"
+READOUT_CONFIG_NAME = "config.json"
+
 NATIVE_V3_READOUT_REVISION = "cosmos-native-v3-place-pick-two-query-sigmoid-v3"
 LEGACY_READOUT_REVISION = "cosmos-place-pick-two-query-absolute-sigmoid-readout-v1"
 SUPPORTED_READOUT_REVISIONS = (NATIVE_V3_READOUT_REVISION, LEGACY_READOUT_REVISION)
@@ -36,6 +42,11 @@ FEATURE_SEGMENTS = {"und": (0, 1), "gen": (2, 3), "both": (0, 1, 2, 3)}
 # pick; waypoint 0 is the left hand, waypoint 1 the right hand.
 BOX_SLOTS = ("place", "pick")
 WAYPOINT_SLOTS = ("left", "right")
+
+
+def readout_config_path(model_path: str | Path) -> Path:
+    """Path of the head recipe inside an exported model directory."""
+    return Path(model_path) / READOUT_COMPONENT / READOUT_CONFIG_NAME
 
 
 @dataclass(frozen=True)
@@ -163,7 +174,11 @@ class ReadoutHeads(nn.Module):
         )
 
 
-def token_layout(vision_grid: tuple[int, int], text_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def token_layout(
+    vision_grid: tuple[int, int],
+    text_len: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Segment ids and patch-centre xy for ``cat(und_hidden, gen_hidden)``.
 
     Vision tokens are row-major patches of the padded latent canvas; text tokens

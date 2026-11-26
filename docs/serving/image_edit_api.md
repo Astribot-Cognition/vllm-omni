@@ -106,10 +106,14 @@ Content-Type: multipart/form-data
 | `seed` | integer | null | Random seed for reproducibility |
 | `reference_image` | string or array | null | Reference image for inpainting |
 | `mask_image` | string or array | null | Mask for inpainting (white areas will be inpainted) |
+| `return_readouts` | boolean | false | Cosmos3 only: also return the trained box/waypoint heads decoded from this request's first denoising step |
 
 ### Response Format
 
-When `stream=false` or omitted, the endpoint returns the standard image edit response:
+When `stream=false` or omitted, the endpoint returns the standard image edit response.
+Models that decode extra structure add it per image; Cosmos3 adds `data[i].readouts`
+when the request sets `return_readouts=true` and the served export ships the heads
+(see the Cosmos3 readout notes below):
 
 ```json
 {
@@ -178,6 +182,37 @@ data: {"object":"error","created":1701234567,"model":"tencent/HunyuanImage-3.0-I
 
 data: [DONE]
 ```
+
+## Cosmos3 Readouts
+
+A Cosmos3 export that carries `readout/` can answer `return_readouts=true` with the
+normalized place/pick boxes and the left/right waypoint trajectories next to the
+image:
+
+```json
+{
+  "data": [
+    {
+      "b64_json": "<base64-encoded PNG>",
+      "readouts": {
+        "revision": "cosmos-native-v3-place-pick-two-query-sigmoid-v3",
+        "coordinate_space": "normalized_content_xy",
+        "boxes": {
+          "place": {"score": 0.93, "xyxy": [0.21, 0.30, 0.44, 0.61]},
+          "pick": {"score": 0.88, "xyxy": [0.10, 0.12, 0.33, 0.40]}
+        },
+        "waypoints": {"left": [[0.5, 0.6]], "right": [[0.4, 0.7]]}
+      }
+    }
+  ]
+}
+```
+
+The heads decode the first denoising step, so requesting them adds no extra
+transformer pass. They need eager execution: manual CUDA graphs replay without
+Python forward hooks and reject the request. One sample per request; exports
+without `readout/` answer 400 and the server logs the missing capability at
+startup.
 
 ## Examples
 
